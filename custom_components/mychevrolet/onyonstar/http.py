@@ -2,7 +2,7 @@
 
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
-from math import isfinite
+from math import ceil, isfinite
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -16,12 +16,47 @@ class CloudError(Exception):
     """GM returned no usable response."""
 
     def __init__(
-        self, status: int = 0, retry_after: float = 0, *, invalid_grant: bool = False
+        self,
+        status: int = 0,
+        retry_after: float = 0,
+        *,
+        invalid_grant: bool = False,
+        stage: str = "",
+        reason: str = "",
     ) -> None:
         super().__init__(f"GM HTTP {status}" if status else "GM response unavailable")
         self.status = status
         self.retry_after = retry_after
         self.invalid_grant = invalid_grant
+        self.stage = stage
+        self.reason = reason
+
+
+def cloud_error_summary(error: CloudError) -> str:
+    """Render only allowlisted descriptions and numeric protocol metadata."""
+    stage = {
+        "microsoft_token": "Microsoft token request",
+        "gm_token_exchange": "GM API token exchange",
+        "vehicle_list": "Vehicle list (GET /api/v1/account/vehicles)",
+        "garage_list": "Garage fallback (POST /mbff/garage/v1)",
+        "discovery_cooldown": "Local vehicle-discovery cooldown",
+        "token_cooldown": "Local token-request cooldown",
+    }.get(error.stage, "Vehicle discovery")
+    reason = {
+        "invalid_json": "response was not valid JSON",
+        "unexpected_payload": "JSON response had an unexpected structure",
+        "graphql_errors": "garage response contained GraphQL errors",
+        "invalid_token": "response lacked a usable access token or expiry",
+        "transport": "connection failed or timed out",
+        "cooldown": "request was not sent while a local cooldown is active",
+    }.get(error.reason, "request failed")
+    status = f"; HTTP {error.status}" if 100 <= error.status <= 599 else ""
+    delay = (
+        f"; retry in {ceil(error.retry_after)} seconds"
+        if isfinite(error.retry_after) and error.retry_after > 0
+        else ""
+    )
+    return f"{stage}: {reason}{status}{delay}."
 
 
 class AuthError(Exception):
@@ -85,9 +120,12 @@ async def request_json(
                     retry_delay(response.headers.get("Retry-After", "")),
                     invalid_grant=invalid_grant,
                 )
-            result = await response.json(content_type=None)
-    except aiohttp.ClientError, TimeoutError, ValueError:
-        raise CloudError from None
+            try:
+                result = await response.json(content_type=None)
+            except ValueError:
+                raise CloudError(status, reason="invalid_json") from None
+    except aiohttp.ClientError, TimeoutError:
+        raise CloudError(reason="transport") from None
     if not isinstance(result, dict):
-        raise CloudError
+        raise CloudError(status, reason="unexpected_payload")
     return result

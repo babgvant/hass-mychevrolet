@@ -6,6 +6,7 @@ import json
 import logging
 import time
 from collections.abc import Mapping
+from math import ceil
 from typing import Any
 from uuid import uuid4
 
@@ -30,7 +31,7 @@ from .const import (
 from .onyonstar.auth import BrowserAttempt, GMAuth
 from .onyonstar.auth.native import NativeLogin, NativeUnavailable
 from .onyonstar.client import Account
-from .onyonstar.http import AuthError, CloudError
+from .onyonstar.http import AuthError, CloudError, cloud_error_summary
 
 SECRET_INPUT = selector.TextSelector(
     selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
@@ -65,6 +66,7 @@ class MyChevroletConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     _reauth: bool = False
     _native: NativeLogin | None = None
     _native_failure_detail: str = "The native sign-in could not complete."
+    _discovery_failure_detail: str = "No vehicle discovery failure has been recorded."
 
     def _native_failure(self, error: Exception) -> None:
         """Report only fixed local descriptions, never server payloads or URLs."""
@@ -276,7 +278,27 @@ class MyChevroletConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             self._abort_if_unique_id_configured()
         try:
             records = await self._candidate.vehicles()
-        except CloudError, OSError:
+        except (CloudError, OSError) as err:
+            details = list(self._candidate.discovery_diagnostics)
+            failure = (
+                cloud_error_summary(err)
+                if isinstance(err, CloudError)
+                else "Vehicle discovery: connection or local I/O failed."
+            )
+            if failure not in details:
+                details.append(failure)
+            remaining = (
+                self._candidate.endpoint_deadlines.get("vehicles", 0) - time.monotonic()
+            )
+            if remaining > 0 and not (
+                isinstance(err, CloudError) and err.reason == "cooldown"
+            ):
+                details.append(
+                    f"Discovery retry available in {ceil(remaining)} seconds."
+                )
+            # Only fixed local text and numeric status/delay fields enter logs.
+            self._discovery_failure_detail = " ".join(details)
+            _LOGGER.warning("GM setup discovery: %s", self._discovery_failure_detail)
             return await self.async_step_retry_discovery()
         if self._reauth:
             if not set(entry.data[CONF_VEHICLES]).issubset(records):
@@ -315,7 +337,9 @@ class MyChevroletConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             except AuthError:
                 return self.async_abort(reason="authorization_expired")
         return self.async_show_form(
-            step_id="retry_discovery", data_schema=vol.Schema({})
+            step_id="retry_discovery",
+            data_schema=vol.Schema({}),
+            description_placeholders={"detail": self._discovery_failure_detail},
         )
 
     async def async_step_vehicles(

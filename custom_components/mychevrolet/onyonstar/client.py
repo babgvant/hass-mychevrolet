@@ -13,7 +13,7 @@ from urllib.parse import urlsplit
 from .api import OnStarAPIClient
 from .auth import GMAuth
 from .commands import CommandFactory
-from .http import EV_HOST, AuthError, CloudError, request_json
+from .http import EV_HOST, AuthError, CloudError, cloud_error_summary, request_json
 
 VEHICLES = "/account/vehicles?includeCommands=true&includeEntitlements=true&includeModules=true"
 GARAGE = "/mbff/garage/v1"
@@ -39,25 +39,48 @@ class Account:
         self._discovery_expires = 0.0
         self._discovery_lock = asyncio.Lock()
         self.endpoint_deadlines: dict[str, float] = {}
+        self.discovery_diagnostics: list[str] = []
+
+    async def _discovery_request(
+        self, stage: str, method: str, path: str, **kwargs: Any
+    ) -> dict[str, Any]:
+        try:
+            return await self.api.api_request(method, path, **kwargs)
+        except CloudError as error:
+            if not error.stage:
+                error.stage = stage
+            self.discovery_diagnostics.append(cloud_error_summary(error))
+            raise
 
     async def _discover(self) -> list:
+        self.discovery_diagnostics = []
         try:
-            result = await self.api.api_request("GET", VEHICLES)
+            result = await self._discovery_request("vehicle_list", "GET", VEHICLES)
         except CloudError as error:
-            if error.status not in (403, 404, 410):
+            if error.stage != "vehicle_list" or error.status not in (403, 404, 410):
                 raise
         else:
             vehicles = object_at(result, "vehicles").get("vehicle")
             if isinstance(vehicles, list) and vehicles:
                 return vehicles
-        result = await self.api.api_request(
+            self.discovery_diagnostics.append(
+                "Vehicle list returned no usable vehicle array; trying garage fallback."
+            )
+        result = await self._discovery_request(
+            "garage_list",
             "POST",
             GARAGE,
             text_body="query getVehiclesMBFF { vehicles { vin make model nickName year onstarCapable vehicleType } }",
         )
         vehicles = object_at(result, "data").get("vehicles")
         if result.get("errors") or not isinstance(vehicles, list):
-            raise CloudError
+            raise CloudError(
+                200,
+                stage="garage_list",
+                reason="graphql_errors"
+                if result.get("errors")
+                else "unexpected_payload",
+            )
         return [
             {**vehicle, "garage_record": True}
             for vehicle in vehicles
@@ -96,10 +119,17 @@ class Account:
                 return self._vehicles
             deadline = self.endpoint_deadlines.get("vehicles", 0)
             if now < deadline:
-                raise CloudError(429, deadline - now)
+                raise CloudError(
+                    retry_after=deadline - now,
+                    stage="discovery_cooldown",
+                    reason="cooldown",
+                )
             try:
                 vehicles = await self._discover()
             except CloudError as error:
+                summary = cloud_error_summary(error)
+                if summary not in self.discovery_diagnostics:
+                    self.discovery_diagnostics.append(summary)
                 self.endpoint_deadlines["vehicles"] = time.monotonic() + max(
                     1800 if error.status == 429 else 60, error.retry_after
                 )

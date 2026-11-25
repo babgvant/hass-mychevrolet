@@ -46,7 +46,7 @@
       },
       "retry_discovery": {
         "title": "Retry vehicle discovery",
-        "description": "GM did not return the vehicle list. Wait for service or throttling to recover, then retry with your current sign-in."
+        "description": "{detail} Wait for any indicated cooldown, then submit to retry using your current sign-in. No new browser login is needed unless authorization expires."
       },
       "native": {
         "title": "Sign in to GM in Home Assistant",

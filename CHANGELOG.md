@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Report setup discovery failures by token exchange, vehicle-list request or garage fallback, with HTTP status and cooldown details in the setup screen and sanitized warning logs.
 - Show the native sign-in failure stage and sanitized reason in the fallback screen and logs.
 - Add experimental native GM password and interactive authenticator MFA sign-in in Home Assistant, with browser/token fallback. Native sign-in remains optional pending live validation.
 - Accept GM's observed trailing-slash mobile callback and clarify that manual setup needs the response Location header, not the HTTPS request URL.

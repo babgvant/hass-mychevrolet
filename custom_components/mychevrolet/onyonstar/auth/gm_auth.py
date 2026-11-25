@@ -185,6 +185,8 @@ class GMAuth:
                 data={"client_id": CLIENT_ID, **form},
             )
         except CloudError as error:
+            if not error.stage:
+                error.stage = "microsoft_token"
             if error.invalid_grant or error.status in (401, 403):
                 raise AuthError from None
             raise
@@ -253,7 +255,11 @@ class GMAuth:
                 raise AuthError
             now = time.monotonic()
             if now < self._blocked_until:
-                raise CloudError(429, self._blocked_until - now)
+                raise CloudError(
+                    retry_after=self._blocked_until - now,
+                    stage="token_cooldown",
+                    reason="cooldown",
+                )
             try:
                 await self._persist()
                 if self._gm_token != rejected and now + 60 < self._gm_expires:
@@ -293,6 +299,7 @@ class GMAuth:
                 },
             )
         except CloudError as error:
+            error.stage = "gm_token_exchange"
             if error.invalid_grant or error.status in (401, 403):
                 raise AuthError from None
             raise
@@ -300,14 +307,16 @@ class GMAuth:
         try:
             lifetime = float(result["expires_in"])
         except KeyError, ValueError, TypeError, OverflowError:
-            raise CloudError from None
+            raise CloudError(
+                stage="gm_token_exchange", reason="invalid_token"
+            ) from None
         if (
             not isinstance(token, str)
             or not token
             or not isfinite(lifetime)
             or lifetime <= 0
         ):
-            raise CloudError
+            raise CloudError(stage="gm_token_exchange", reason="invalid_token")
         # This is a service bearer from GM over TLS. Identity and entitlement
         # decisions use the verified upstream subject and authenticated API data.
         self._gm_token = token
