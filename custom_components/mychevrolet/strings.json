@@ -65,7 +65,7 @@
       },
       "native_unavailable": {
         "title": "GM requires browser sign-in",
-        "description": "GM blocked the native request, the connection failed, or this sign-in journey is not supported. Continue with browser sign-in or import tokens. Native sign-in supports authenticator codes; email and SMS verification are not supported yet.",
+        "description": "{detail} Continue with browser sign-in or import tokens. Native sign-in supports authenticator codes; email and SMS verification are not supported yet.",
         "menu_options": {
           "browser": "Sign in with GM in your browser",
           "token_import": "Import GM identity tokens"

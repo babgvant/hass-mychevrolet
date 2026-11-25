@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from collections.abc import Mapping
 from typing import Any
@@ -35,6 +36,24 @@ SECRET_INPUT = selector.TextSelector(
     selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
 )
 
+_LOGGER = logging.getLogger(__name__)
+_NATIVE_STAGES = {
+    "discovery": "loading GM authentication metadata",
+    "authorization_page": "loading the GM sign-in page",
+    "credential_submission": "submitting the password form",
+    "mfa_page": "loading the MFA page",
+    "mfa_submission": "submitting the authenticator code",
+    "mfa_confirmation": "finishing MFA",
+    "token_exchange": "exchanging the authorization code",
+}
+_NATIVE_REASONS = {
+    "http_401": "GM returned HTTP 401 to the native request.",
+    "http_403": "GM returned HTTP 403 and refused the native request.",
+    "unexpected_redirect": "GM returned a redirect this native flow does not support.",
+    "unsupported_mfa": "GM returned a verification form without the supported authenticator-code field.",
+    "unsupported_page": "GM returned a page or response the native flow could not recognize.",
+}
+
 
 class MyChevroletConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Authenticate a GM account and select its vehicles."""
@@ -45,6 +64,21 @@ class MyChevroletConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     _vehicles: dict[str, str]
     _reauth: bool = False
     _native: NativeLogin | None = None
+    _native_failure_detail: str = "The native sign-in could not complete."
+
+    def _native_failure(self, error: Exception) -> None:
+        """Report only fixed local descriptions, never server payloads or URLs."""
+        stage = _NATIVE_STAGES.get(
+            self._native.stage if self._native is not None else "", "signing in to GM"
+        )
+        reason = (
+            _NATIVE_REASONS.get(error.reason, _NATIVE_REASONS["unsupported_page"])
+            if isinstance(error, NativeUnavailable)
+            else "The connection to GM failed."
+        )
+        self._native_failure_detail = f"Stopped while {stage}. {reason}"
+        _LOGGER.warning("Native GM sign-in: %s", self._native_failure_detail)
+        self._clear_native()
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
@@ -85,8 +119,8 @@ class MyChevroletConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 needs_mfa = await self._native.start(
                     user_input["username"].strip(), user_input["password"]
                 )
-            except NativeUnavailable:
-                self._clear_native()
+            except NativeUnavailable as err:
+                self._native_failure(err)
                 return await self.async_step_native_unavailable()
             except (AuthError, CloudError, OSError) as err:
                 error = (
@@ -116,8 +150,8 @@ class MyChevroletConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             try:
                 await self._native.verify(user_input["code"].strip())
-            except NativeUnavailable:
-                self._clear_native()
+            except NativeUnavailable as err:
+                self._native_failure(err)
                 return await self.async_step_native_unavailable()
             except AuthError:
                 if (
@@ -127,8 +161,8 @@ class MyChevroletConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     self._clear_native()
                     return await self.async_step_native()
                 error = "invalid_mfa"
-            except CloudError, OSError:
-                self._clear_native()
+            except (CloudError, OSError) as err:
+                self._native_failure(err)
                 return await self.async_step_native_unavailable()
             else:
                 self._clear_native()
@@ -142,7 +176,9 @@ class MyChevroletConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_native_unavailable(self) -> ConfigFlowResult:
         """Stop rather than retry blocked or unrecognized website flows."""
         return self.async_show_menu(
-            step_id="native_unavailable", menu_options=["browser", "token_import"]
+            step_id="native_unavailable",
+            menu_options=["browser", "token_import"],
+            description_placeholders={"detail": self._native_failure_detail},
         )
 
     async def _new_candidate(self) -> Account:

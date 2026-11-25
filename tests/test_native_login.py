@@ -247,6 +247,7 @@ async def test_native_ha_fallback_clears_transaction(hass, monkeypatch, error):
     candidate = AsyncMock()
     login = AsyncMock()
     login.clear = Mock()
+    login.stage = "credential_submission"
     login.start.side_effect = error
     monkeypatch.setattr(
         MyChevroletConfigFlow, "_new_candidate", AsyncMock(return_value=candidate)
@@ -267,4 +268,24 @@ async def test_native_ha_fallback_clears_transaction(hass, monkeypatch, error):
     assert result["step_id"] == (
         "native_unavailable" if error is NativeUnavailable else "native"
     )
+    login.clear.assert_called_once()
+    if error is NativeUnavailable:
+        assert "password form" in result["description_placeholders"]["detail"]
+
+
+async def test_failure_detail_never_uses_server_error_text(hass, caplog):
+    from unittest.mock import Mock
+
+    flow = MyChevroletConfigFlow()
+    flow.hass = hass
+    login = Mock()
+    login.stage = "mfa_submission"
+    flow._native = login
+    flow._native_failure(NativeUnavailable("password=private&code=123456"))
+    result = await flow.async_step_native_unavailable()
+    detail = result["description_placeholders"]["detail"]
+    assert "submitting the authenticator code" in detail
+    for private in ("password=private", "123456"):
+        assert private not in detail
+        assert private not in caplog.text
     login.clear.assert_called_once()

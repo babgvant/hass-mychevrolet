@@ -23,6 +23,10 @@ from .gm_auth import BrowserAttempt, GMAuth
 class NativeUnavailable(Exception):
     """GM requires a browser or returned an unsupported login journey."""
 
+    def __init__(self, reason: str = "unsupported_page") -> None:
+        self.reason = reason
+        super().__init__(reason)
+
 
 def page_object(body: str, name: str) -> dict[str, Any]:
     """Read a JSON page variable without evaluating JavaScript."""
@@ -46,6 +50,7 @@ class NativeLogin:
         self._cookies = aiohttp.CookieJar(quote_cookie=False)
         self._settings: dict[str, Any] = {}
         self._mfa = False
+        self.stage = "discovery"
 
     def clear(self) -> None:
         """Discard the login session after success, failure or cancellation."""
@@ -90,7 +95,7 @@ class NativeLogin:
                 if response.status in (301, 302, 303, 307, 308):
                     return "", response.headers.get("Location", "")
                 if response.status in (401, 403):
-                    raise NativeUnavailable
+                    raise NativeUnavailable(f"http_{response.status}")
                 if response.status != 200:
                     raise CloudError(response.status)
                 body = bytearray()
@@ -153,9 +158,10 @@ class NativeLogin:
             try:
                 scheme = urlsplit(redirect).scheme
             except ValueError:
-                raise NativeUnavailable from None
+                raise NativeUnavailable("unexpected_redirect") from None
             if scheme != "msauth.com.gm.mychevrolet":
-                raise NativeUnavailable
+                raise NativeUnavailable("unexpected_redirect")
+            self.stage = "token_exchange"
             await self.auth.authorize(self.attempt, redirect)
             self.clear()
             return "", True
@@ -164,13 +170,16 @@ class NativeLogin:
     async def start(self, username: str, password: str) -> bool:
         """Submit credentials once; return whether authenticator MFA is needed."""
         metadata = await self.auth.metadata()
+        self.stage = "authorization_page"
         body, redirect = await self._request(
             "GET", self.attempt.url(metadata["authorization_endpoint"])
         )
         if redirect:
             raise NativeUnavailable
         self._page(body, "CombinedSigninAndSignup")
+        self.stage = "credential_submission"
         await self._submit({"logonIdentifier": username, "password": password})
+        self.stage = "mfa_page"
         body, complete = await self._confirm("CombinedSigninAndSignup")
         if complete:
             return False
@@ -179,7 +188,7 @@ class NativeLogin:
         if not isinstance(fields, list) or not any(
             isinstance(field, dict) and field.get("ID") == "otpCode" for field in fields
         ):
-            raise NativeUnavailable
+            raise NativeUnavailable("unsupported_mfa")
         self._mfa = True
         self.attempt.deadline = min(self.attempt.deadline, time.monotonic() + 180)
         return True
@@ -188,7 +197,9 @@ class NativeLogin:
         """Submit a user-provided authenticator code without retaining it."""
         if not self._mfa or not re.fullmatch(r"[0-9]{6}", code):
             raise AuthError
+        self.stage = "mfa_submission"
         await self._submit({"otpCode": code})
+        self.stage = "mfa_confirmation"
         _, complete = await self._confirm("SelfAsserted")
         if not complete:
             raise NativeUnavailable

@@ -27,15 +27,17 @@ async def main() -> None:
         try:
             await login.start("", "")
             result = "unexpected_success"
-        except NativeUnavailable:
-            result = "browser_required_or_unsupported_page"
+        except NativeUnavailable as error:
+            result = error.reason
         except AuthError:
             result = "empty_credentials_rejected"
         except CloudError as error:
             result = f"transport_error_{error.status}"
         finally:
             login.clear()
-        print(json.dumps({"result": result, "account_used": False}))
+        print(
+            json.dumps({"result": result, "stage": login.stage, "account_used": False})
+        )
 
 
 if __name__ == "__main__":

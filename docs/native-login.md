@@ -16,4 +16,6 @@ The account capture demonstrates the browser journey, not successful native auth
 
 Run `python scripts/probe_native_login.py` explicitly to repeat the anonymous check. It submits one empty credential form and prints a sanitized outcome. It never reads the capture or accepts account credentials. Do not run it repeatedly against a block.
 
+A subsequent anonymous probe with stage diagnostics returned HTTP 403 at credential submission, before MFA. This establishes a native submission refusal from the development machine, not the exact reason for a user's Home Assistant failure. The fallback screen and warning log now report fixed local descriptions of the stage and failure type; response bodies, redirect URLs and credentials are never included. A generic fallback screenshot from the earlier build cannot distinguish an HTTP refusal from an unsupported page.
+
 Native sign-in is labeled experimental and the browser path remains first in setup. Before changing that default, complete a native password/authenticator sign-in from the target Home Assistant instance, confirm vehicle discovery and token renewal, and exercise reauthentication with the same account. Email and SMS verification remain unsupported. Mocked tests verify protocol handling but cannot demonstrate that GM permits a native session.
