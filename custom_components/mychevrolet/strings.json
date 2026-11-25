@@ -1,42 +1,196 @@
 {
-  "title": "myChevrolet",
-  "step": {
-    "user": {
-      "title": "myChevrolet / OnStar account",
-      "description": "Enter your myChevrolet (OnStar) account credentials for the US region.",
-      "data": {
-        "username": "Account email",
-        "password": "Password",
-        "vin": "Vehicle VIN (17 characters)",
-        "totp_secret": "TOTP secret (from your GM account's authenticator setup)",
-        "device_id": "Device ID (optional UUID; auto-generated if blank)",
-        "onstar_pin": "Account PIN (optional)"
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect a GM account",
+        "menu_options": {
+          "browser": "Sign in with GM in your browser",
+          "token_import": "Import GM identity tokens"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Renew GM authorization",
+        "menu_options": {
+          "browser": "Sign in with GM in your browser",
+          "token_import": "Import GM identity tokens"
+        }
+      },
+      "browser_unavailable": {
+        "title": "GM sign-in is temporarily unavailable",
+        "menu_options": {
+          "browser": "Sign in with GM in your browser",
+          "token_import": "Import GM identity tokens"
+        }
+      },
+      "browser": {
+        "title": "Sign in directly with GM",
+        "description": "Open your browser’s Network panel and enable persistent logging, then open [GM sign-in]({url}) and complete sign-in and MFA with GM. Find the final 302 from custlogin.gm.com and paste its full msauth.com.gm.mychevrolet://auth Location value here. Close the Network panel when done.",
+        "data": {
+          "redirect": "GM redirect URL"
+        }
+      },
+      "token_import": {
+        "title": "Import GM identity tokens",
+        "description": "Paste a Microsoft refresh token or the contents of a local microsoft_tokens.json obtained from this GM client. Home Assistant will validate it directly with GM.",
+        "data": {
+          "tokens": "Refresh token or Microsoft token JSON"
+        }
+      },
+      "vehicles": {
+        "title": "Select vehicles",
+        "data": {
+          "vehicles": "Vehicles"
+        }
+      },
+      "retry_discovery": {
+        "title": "Retry vehicle discovery",
+        "description": "GM did not return the vehicle list. Wait for service or throttling to recover, then retry with your current sign-in."
       }
     },
-    "reauth_confirm": {
-      "title": "Re-authenticate myChevrolet",
-      "description": "The stored credentials were rejected. Re-enter them to continue.",
-      "data": {
-        "username": "Account email",
-        "password": "Password",
-        "totp_secret": "TOTP secret"
-      }
+    "error": {
+      "invalid_auth": "GM authorization was rejected, invalid or expired. Start a new sign-in or obtain a fresh token.",
+      "cannot_connect": "The integration could not complete the request. Try again.",
+      "select_vehicles": "Select at least one available vehicle."
+    },
+    "abort": {
+      "already_configured": "This account or vehicle is already configured.",
+      "no_new_vehicles": "GM returned no unconfigured vehicles.",
+      "wrong_account": "Sign in with the GM account associated with the configured vehicles.",
+      "authorization_expired": "GM authorization expired. Start a fresh sign-in."
     }
   },
   "options": {
-    "title": "myChevrolet options",
-    "data": {
-      "scan_interval": "Poll interval (minutes)",
-      "cheater_mode": "Recreate client on rate-limit (429) to escape per-device throttling"
+    "step": {
+      "init": {
+        "title": "Telemetry and remote controls",
+        "data": {
+          "scan_interval": "Polling interval (minutes)",
+          "location": "Collect vehicle GPS location",
+          "remote_controls": "Allow non-privileged remote vehicle controls"
+        },
+        "data_description": {
+          "scan_interval": "GM limits vary by vehicle and subscription. Default 30 minutes, minimum 15.",
+          "remote_controls": "Requires advertised OnStar command access. Commands that require a PIN or privileged session stay disabled."
+        }
+      }
     }
   },
-  "error": {
-    "invalid_auth": "Authentication failed. Check your credentials and TOTP secret.",
-    "cannot_connect": "Could not reach the OnStar cloud. Check your connection and try again.",
-    "unknown": "An unexpected error occurred."
-  },
-  "abort": {
-    "already_configured": "This vehicle (VIN) is already configured.",
-    "reauth_successful": "myChevrolet re-authentication was successful."
+  "entity": {
+    "sensor": {
+      "odometer": {
+        "name": "Odometer"
+      },
+      "battery_level": {
+        "name": "Battery level"
+      },
+      "target_charge_level": {
+        "name": "Target charge level"
+      },
+      "ev_range": {
+        "name": "EV range"
+      },
+      "charge_state": {
+        "name": "Charge state"
+      },
+      "plug_state": {
+        "name": "Plug state"
+      },
+      "plug_voltage": {
+        "name": "Plug voltage"
+      },
+      "charger_power_level": {
+        "name": "Charger power level"
+      },
+      "charge_complete": {
+        "name": "Estimated charge completion"
+      },
+      "time_to_complete": {
+        "name": "Estimated time to charge completion"
+      },
+      "charge_mode": {
+        "name": "Charge mode"
+      },
+      "last_trip_efficiency": {
+        "name": "Last trip efficiency"
+      },
+      "trip_consumption": {
+        "name": "Trip consumption rate"
+      },
+      "discharge_min_soc": {
+        "name": "Discharge minimum state of charge"
+      },
+      "tire_pressure_lf": {
+        "name": "Tire pressure left front"
+      },
+      "tire_pressure_rf": {
+        "name": "Tire pressure right front"
+      },
+      "tire_pressure_lr": {
+        "name": "Tire pressure left rear"
+      },
+      "tire_pressure_rr": {
+        "name": "Tire pressure right rear"
+      },
+      "last_successful_update": {
+        "name": "Last successful telemetry read"
+      },
+      "telemetry_age": {
+        "name": "Newest telemetry age"
+      },
+      "health": {
+        "name": "Health",
+        "state": {
+          "reauth_required": "Reauthentication required",
+          "rate_limited": "Rate limited",
+          "degraded": "Degraded",
+          "stale": "Stale",
+          "ok": "OK"
+        }
+      },
+      "reported_battery_energy": {
+        "name": "Reported battery energy"
+      },
+      "lifetime_reported_energy": {
+        "name": "Lifetime energy used"
+      }
+    },
+    "binary_sensor": {
+      "plug_state": {
+        "name": "Plugged in"
+      },
+      "charge_location_set": {
+        "name": "Charge location set"
+      },
+      "at_charge_location": {
+        "name": "At charge location"
+      },
+      "discharge_enabled": {
+        "name": "Discharge enabled"
+      }
+    },
+    "button": {
+      "refresh_data": {
+        "name": "Update data"
+      },
+      "honk_flash": {
+        "name": "Honk and flash"
+      },
+      "remote_start": {
+        "name": "Remote start"
+      },
+      "remote_stop": {
+        "name": "Remote stop"
+      }
+    },
+    "lock": {
+      "door_lock": {
+        "name": "Door lock"
+      }
+    },
+    "device_tracker": {
+      "location": {
+        "name": "Location"
+      }
+    }
   }
 }

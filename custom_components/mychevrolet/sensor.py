@@ -1,8 +1,10 @@
-"""Sensor platform for myChevrolet."""
+"""Vehicle telemetry and freshness sensors."""
 
 from __future__ import annotations
 
-import logging
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 from homeassistant.components.sensor import (
@@ -12,217 +14,343 @@ from homeassistant.components.sensor import (
 )
 from homeassistant.const import (
     PERCENTAGE,
+    EntityCategory,
     UnitOfElectricPotential,
+    UnitOfEnergy,
     UnitOfLength,
     UnitOfPressure,
+    UnitOfTime,
 )
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .const import DOMAIN
-from .entity import MyChevroletEntity
-from .helpers import get_diagnostic_value, get_diagnostics, is_ev
+from .coordinator import (
+    MyChevroletConfigEntry,
+    MyChevroletDataUpdateCoordinator,
+    Sample,
+)
+from .entity import MyChevroletEntity, TelemetryEntity
+from .helpers import number, timestamp
 
-_LOGGER = logging.getLogger(__name__)
+MEASUREMENT = SensorStateClass.MEASUREMENT
 
-# Map internal sensor unique_id to the exact pyonstar diagnostic name.
-# pyonstar returns names like "EV BATTERY LEVEL", not "BATTERY_LEVEL".
-DIAG_MAP: dict[str, str] = {
-    "battery_level": "EV BATTERY LEVEL",
-    "charge_state": "EV CHARGE STATE",
-    "plug_state": "EV PLUG STATE",
-    "plug_voltage": "EV PLUG VOLTAGE",
-    "charger_power_level": "CHARGER POWER LEVEL",
-    "ev_range": "VEHICLE RANGE",
-    "last_trip_efficiency": "LAST TRIP ELECTRIC ECON",
-    "odometer": "ODOMETER",
-}
+
+def text(value: Any) -> str | None:
+    """Normalize GM's string state while preserving unknown categories."""
+    if isinstance(value, str) and value.strip():
+        return value.strip().lower().replace(" ", "_")
+    return None
+
+
+def charge_state(value: Any) -> str | None:
+    """Normalize documented unplugged and charging values."""
+    state = text(value)
+    if state in {
+        "unconnected",
+        "not_charging",
+        "charging_complete",
+        "fully_charged",
+        "charging",
+    }:
+        return {
+            "unconnected": "not_charging",
+            "charging_complete": "fully_charged",
+        }.get(state, state)
+    return state
+
+
+@dataclass(frozen=True)
+class Metric:
+    """A sensor backed by a diagnostic element, EV sample, or both."""
+
+    key: str
+    diagnostic: tuple[str, str] | None = None
+    ev: str | None = None
+    unit: str | None = None
+    device_class: SensorDeviceClass | None = None
+    state_class: SensorStateClass | None = MEASUREMENT
+    parse: Callable[[Any], Any] = number
+
+
+def diag(name: str) -> tuple[str, str]:
+    """Use the group itself as the common element name."""
+    return name, name
+
+
+METRICS = (
+    Metric(
+        "odometer",
+        diag("ODOMETER"),
+        "odo",
+        UnitOfLength.KILOMETERS,
+        SensorDeviceClass.DISTANCE,
+        SensorStateClass.TOTAL_INCREASING,
+    ),
+    Metric(
+        "battery_level",
+        diag("EV BATTERY LEVEL"),
+        "soc",
+        PERCENTAGE,
+        SensorDeviceClass.BATTERY,
+    ),
+    Metric(
+        "target_charge_level",
+        ev="tcl",
+        unit=PERCENTAGE,
+        device_class=SensorDeviceClass.BATTERY,
+    ),
+    Metric(
+        "ev_range",
+        diag("VEHICLE RANGE"),
+        "ravg",
+        UnitOfLength.KILOMETERS,
+        SensorDeviceClass.DISTANCE,
+    ),
+    Metric(
+        "reported_battery_energy",
+        ev="kwh",
+        unit=UnitOfEnergy.KILO_WATT_HOUR,
+        device_class=SensorDeviceClass.ENERGY_STORAGE,
+    ),
+    Metric(
+        "charge_state",
+        diag("EV CHARGE STATE"),
+        "cstate",
+        state_class=None,
+        parse=charge_state,
+    ),
+    Metric("plug_state", diag("EV PLUG STATE"), "cplug", state_class=None, parse=text),
+    Metric(
+        "plug_voltage",
+        diag("EV PLUG VOLTAGE"),
+        unit=UnitOfElectricPotential.VOLT,
+        device_class=SensorDeviceClass.VOLTAGE,
+    ),
+    Metric(
+        "charger_power_level", diag("CHARGER POWER LEVEL"), state_class=None, parse=text
+    ),
+    Metric(
+        "charge_complete",
+        diag("EV ESTIMATED CHARGE END"),
+        "ceta",
+        device_class=SensorDeviceClass.TIMESTAMP,
+        state_class=None,
+        parse=timestamp,
+    ),
+    Metric("charge_mode", ev="cmode", state_class=None, parse=text),
+    Metric("last_trip_efficiency", diag("LAST TRIP ELECTRIC ECON")),
+    Metric("trip_consumption", ev="tripcons", unit="kWh/100km"),
+    Metric(
+        "lifetime_reported_energy",
+        diag("LIFETIME ENERGY USED"),
+        unit=UnitOfEnergy.KILO_WATT_HOUR,
+        device_class=SensorDeviceClass.ENERGY,
+        state_class=SensorStateClass.TOTAL_INCREASING,
+    ),
+    Metric(
+        "discharge_min_soc",
+        ev="disMinSoc",
+        unit=PERCENTAGE,
+        device_class=SensorDeviceClass.BATTERY,
+    ),
+    *(
+        Metric(
+            f"tire_pressure_{wheel.lower()}",
+            ("TIRE PRESSURE", f"TIRE PRESSURE {wheel}"),
+            unit=UnitOfPressure.KPA,
+            device_class=SensorDeviceClass.PRESSURE,
+        )
+        for wheel in ("LF", "RF", "LR", "RR")
+    ),
+)
+
+
+def select_sample(
+    coordinator: MyChevroletDataUpdateCoordinator, metric: Metric
+) -> Sample | None:
+    """Prefer an attributable vehicle timestamp over a receipt timestamp."""
+    diagnostics = (
+        coordinator.diagnostics.get(metric.diagnostic) if metric.diagnostic else None
+    )
+    ev = coordinator.ev.get(metric.ev) if metric.ev else None
+    if diagnostics and metric.parse(diagnostics.value) is None:
+        diagnostics = None
+    if ev and metric.parse(ev.value) is not None:
+        if diagnostics and diagnostics.source == "vehicle" and diagnostics.at > ev.at:
+            return diagnostics
+        return ev
+    return diagnostics
 
 
 async def async_setup_entry(
-    hass, entry, async_add_entities
-) -> None:  # type: ignore[no-untyped-def]
-    """Set up sensors from the diagnostics the vehicle supports."""
-    coordinator: DataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id][
-        "coordinator"
-    ]
-    vin = entry.data["vin"]
-
-    sensors: list[SensorEntity] = [MyChevroletOdometer(coordinator, vin)]
-
-    # Integration health sensor — always present, reflects coordinator health.
-    sensors.append(MyChevroletHealthSensor(coordinator, vin))
-
-    diagnostics = get_diagnostics(coordinator.data)
-    ev = is_ev(diagnostics)
-    if ev:
-        sensors += [
-            MyChevroletSensor(coordinator, vin, "battery_level", "Battery Level",
-                              PERCENTAGE, SensorDeviceClass.BATTERY, SensorStateClass.MEASUREMENT),
-            MyChevroletSensor(coordinator, vin, "charge_state", "Charge State",
-                              None, SensorDeviceClass.ENUM, None,
-                              options=["charging", "not_charging", "fully_charged", "unknown"]),
-            MyChevroletSensor(coordinator, vin, "plug_state", "Plug State",
-                              None, SensorDeviceClass.ENUM, None,
-                              options=["plugged", "unplugged", "unknown"]),
-            MyChevroletSensor(coordinator, vin, "plug_voltage", "Plug Voltage",
-                              UnitOfElectricPotential.VOLT, SensorDeviceClass.VOLTAGE,
-                              SensorStateClass.MEASUREMENT),
-            MyChevroletSensor(coordinator, vin, "charger_power_level", "Charger Power Level",
-                              None, SensorDeviceClass.ENUM, None),
-            MyChevroletSensor(coordinator, vin, "ev_range", "EV Range",
-                              UnitOfLength.KILOMETERS, SensorDeviceClass.DISTANCE,
-                              SensorStateClass.MEASUREMENT),
-        ]
-
-    sensors += [
-        MyChevroletSensor(coordinator, vin, "last_trip_efficiency", "Last Trip Efficiency",
-                          None, None, SensorStateClass.MEASUREMENT),
-        MyChevroletTirePressure(coordinator, vin, "lf", "Left Front"),
-        MyChevroletTirePressure(coordinator, vin, "rf", "Right Front"),
-        MyChevroletTirePressure(coordinator, vin, "lr", "Left Rear"),
-        MyChevroletTirePressure(coordinator, vin, "rr", "Right Rear"),
-    ]
-
-    async_add_entities(sensors)
-
-
-class MyChevroletOdometer(MyChevroletEntity, SensorEntity):
-    """Odometer reading, available on every vehicle."""
-
-    _attr_name = "Odometer"
-    _attr_native_unit_of_measurement = UnitOfLength.KILOMETERS
-    _attr_device_class = SensorDeviceClass.DISTANCE
-    _attr_state_class = SensorStateClass.TOTAL_INCREASING
-
-    def __init__(self, coordinator, vin):  # type: ignore[no-untyped-def]
-        super().__init__(coordinator, "odometer", "Odometer")
-
-    @property
-    def native_value(self) -> float | None:
-        """Return the odometer value."""
-        value = get_diagnostic_value(
-            get_diagnostics(self.coordinator.data), "ODOMETER"
+    hass: HomeAssistant,
+    entry: MyChevroletConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Register supported sensors, including capabilities learned after setup."""
+    for coordinator in entry.runtime_data.values():
+        async_add_entities(
+            [
+                HealthSensor(coordinator, "health"),
+                FreshnessSensor(coordinator, "last_successful_update"),
+                FreshnessSensor(coordinator, "telemetry_age"),
+            ]
         )
-        return _to_float(value)
+        _watch_metrics(entry, coordinator, async_add_entities)
 
 
-class MyChevroletSensor(MyChevroletEntity, SensorEntity):
-    """A diagnostic-backed sensor with a fixed name/unit/device class."""
+def _watch_metrics(
+    entry: MyChevroletConfigEntry,
+    coordinator: MyChevroletDataUpdateCoordinator,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    added: set[str] = set()
+
+    @callback
+    def add_supported() -> None:
+        entities = []
+        for metric in METRICS:
+            if metric.key in added:
+                continue
+            supported = (
+                metric.diagnostic
+                and metric.diagnostic[0] in coordinator.onstar.diagnostics_supported
+            )
+            if supported or select_sample(coordinator, metric) is not None:
+                added.add(metric.key)
+                entities.append(MetricSensor(coordinator, metric))
+        if "time_to_complete" not in added and select_sample(
+            coordinator, CHARGE_COMPLETE
+        ):
+            added.add("time_to_complete")
+            entities.append(ChargeTimeSensor(coordinator, "time_to_complete"))
+        if entities:
+            async_add_entities(entities)
+
+    add_supported()
+    entry.async_on_unload(coordinator.async_add_listener(add_supported))
+
+
+class MetricSensor(TelemetryEntity, SensorEntity):
+    """A measurement with individually tracked freshness."""
 
     def __init__(
-        self,
-        coordinator,  # type: ignore[no-untyped-def]
-        vin,
-        unique_id,
-        name,
-        unit,
-        device_class,
-        state_class,
-        options=None,
-    ):
-        super().__init__(coordinator, unique_id, name)
-        self._diagnostic = DIAG_MAP.get(unique_id, unique_id.upper())
-        self._attr_native_unit_of_measurement = unit
-        self._attr_device_class = device_class
-        self._attr_state_class = state_class
-        if options is not None:
-            self._attr_options = options
+        self, coordinator: MyChevroletDataUpdateCoordinator, metric: Metric
+    ) -> None:
+        super().__init__(coordinator, metric.key)
+        self.metric = metric
+        self._attr_device_class = metric.device_class
+        self._attr_state_class = metric.state_class
+        self._attr_native_unit_of_measurement = metric.unit
+
+    @property
+    def sample(self) -> Sample | None:
+        """Select the best available data source."""
+        return select_sample(self.coordinator, self.metric)
 
     @property
     def native_value(self) -> Any:
-        """Return the diagnostic value, mapped for enum sensors."""
-        diagnostics = get_diagnostics(self.coordinator.data)
-        if self._attr_device_class is SensorDeviceClass.ENUM:
-            return _enum(self._diagnostic, diagnostics)
-        return _to_float(get_diagnostic_value(diagnostics, self._diagnostic))
+        """Return the parsed measurement."""
+        return self.metric.parse(self.sample.value) if self.sample else None
 
 
-class MyChevroletTirePressure(MyChevroletEntity, SensorEntity):
-    """Per-wheel tire pressure."""
+CHARGE_COMPLETE = next(metric for metric in METRICS if metric.key == "charge_complete")
+PLUG = next(metric for metric in METRICS if metric.key == "plug_state")
 
-    _attr_native_unit_of_measurement = UnitOfPressure.KPA
-    _attr_device_class = SensorDeviceClass.PRESSURE
-    _attr_state_class = SensorStateClass.MEASUREMENT
 
-    def __init__(self, coordinator, vin, position, position_name):  # type: ignore[no-untyped-def]
-        super().__init__(coordinator, f"tire_pressure_{position}", f"Tire Pressure {position_name}")
-        self._position = position.upper()
+class ChargeTimeSensor(TelemetryEntity, SensorEntity):
+    """Derive time remaining from a fresh GM completion estimate."""
+
+    _attr_device_class = SensorDeviceClass.DURATION
+    _attr_native_unit_of_measurement = UnitOfTime.MINUTES
+    _attr_state_class = MEASUREMENT
 
     @property
-    def native_value(self) -> float | None:
-        """Return this wheel's pressure."""
-        diagnostics = get_diagnostics(self.coordinator.data)
-        return _to_float(
-            get_diagnostic_value(diagnostics, "TIRE PRESSURE", f"TIRE PRESSURE {self._position}")
-        )
+    def sample(self) -> Sample | None:
+        """Use the timestamp estimate rather than a nominal charge rate."""
+        return select_sample(self.coordinator, CHARGE_COMPLETE)
 
     @property
-    def extra_state_attributes(self) -> dict[str, Any]:
-        """Attach the raw status text when present."""
-        diagnostics = get_diagnostics(self.coordinator.data)
-        if not diagnostics:
-            return {}
-        for diagnostic in diagnostics:
-            if diagnostic.get("name") == "TIRE PRESSURE":
-                for element in diagnostic.get("diagnosticElement", []):
-                    if element.get("name") == f"TIRE PRESSURE {self._position}":
-                        message = element.get("message")
-                        return {"status": message} if message else {}
-        return {}
+    def native_value(self) -> int | None:
+        """Return minutes remaining where the estimate is still applicable."""
+        estimate = timestamp(self.sample.value) if self.sample else None
+        plug = select_sample(self.coordinator, PLUG)
+        if (
+            estimate is None
+            or not self.coordinator.fresh(plug)
+            or text(plug.value) != "plugged"
+        ):
+            return None
+        remaining = (estimate - datetime.now(UTC)).total_seconds()
+        return round(remaining / 60) if remaining >= 0 else None
 
 
-def _to_float(value: Any) -> float | None:
-    """Coerce a numeric diagnostic value to float, or None."""
-    if value is None:
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
+class FreshnessSensor(MyChevroletEntity, SensorEntity):
+    """Report the last successful API read or the age of the newest sample."""
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, coordinator: MyChevroletDataUpdateCoordinator, key: str) -> None:
+        super().__init__(coordinator, key)
+        self.key = key
+        if key == "last_successful_update":
+            self._attr_device_class = SensorDeviceClass.TIMESTAMP
+        else:
+            self._attr_device_class = SensorDeviceClass.DURATION
+            self._attr_native_unit_of_measurement = UnitOfTime.SECONDS
+
+    @property
+    def available(self) -> bool:
+        """Keep freshness accessible after a GM failure."""
+        return True
+
+    @property
+    def native_value(self) -> datetime | int | None:
+        """Use vehicle time where supplied and response time otherwise."""
+        if self.key == "last_successful_update":
+            return self.coordinator.last_successful_update
+        sample_times = [sample.at for sample in self.coordinator.diagnostics.values()]
+        sample_times.extend(sample.at for sample in self.coordinator.ev.values())
+        if not sample_times:
+            return None
+        return max(0, round((datetime.now(UTC) - max(sample_times)).total_seconds()))
 
 
-def _enum(name: str, diagnostics) -> str | None:  # type: ignore[no-untyped-def]
-    """Normalise an enum-like diagnostic value to a HA-friendly state."""
-    from .helpers import get_diagnostic_value
+class HealthSensor(MyChevroletEntity, SensorEntity):
+    """Surface auth, endpoint failures and stale input explicitly."""
 
-    value = get_diagnostic_value(diagnostics, name)
-    if value is None:
-        return None
-    known = {"charging", "not_charging", "fully_charged", "plugged", "unplugged"}
-    lowered = str(value).lower()
-    return lowered if lowered in known else "unknown"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_options = ["reauth_required", "rate_limited", "degraded", "stale", "ok"]
 
-
-class MyChevroletHealthSensor(MyChevroletEntity, SensorEntity):
-    """Integration health: last update success and rate-limit status."""
-
-    _attr_name = "Health"
-    _attr_icon = "mdi:heart-pulse"
-
-    def __init__(self, coordinator, vin):  # type: ignore[no-untyped-def]
-        super().__init__(coordinator, "health", "Health")
+    @property
+    def available(self) -> bool:
+        """Keep the health signal visible after auth failure."""
+        return True
 
     @property
     def native_value(self) -> str:
-        """Return the integration health state."""
-        if self.coordinator.is_rate_limited:
+        """Return the most actionable current condition."""
+        coordinator = self.coordinator
+        if coordinator.auth_failed:
+            return "reauth_required"
+        statuses = set(coordinator.endpoint_status.values())
+        if statuses.intersection({"rate_limited", "backoff"}):
             return "rate_limited"
-        if self.coordinator.last_update_success:
+        if (
+            statuses.intersection({"unreachable"})
+            or not coordinator.last_update_success
+        ):
+            return "degraded"
+        if any(
+            coordinator.fresh(sample)
+            for samples in (coordinator.ev, coordinator.diagnostics)
+            for sample in samples.values()
+        ):
             return "ok"
-        return "error"
+        return "stale"
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        """Return health detail attributes."""
-        attrs: dict[str, Any] = {}
-        if self.coordinator.last_successful_update is not None:
-            attrs["last_successful_update"] = self.coordinator.last_successful_update
-        if self.coordinator.is_rate_limited:
-            attrs["rate_limited"] = True
-            dbr = self.coordinator.diagnostics_backoff_remaining
-            lbr = self.coordinator.location_backoff_remaining
-            if dbr is not None:
-                attrs["diagnostics_backoff_remaining_seconds"] = round(dbr, 1)
-            if lbr is not None:
-                attrs["location_backoff_remaining_seconds"] = round(lbr, 1)
-        return attrs
+        """Provide independent endpoint status for automations."""
+        return {"endpoints": dict(self.coordinator.endpoint_status)}

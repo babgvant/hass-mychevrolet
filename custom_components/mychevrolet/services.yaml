@@ -1,5 +1,3 @@
 refresh_data:
-  name: Refresh myChevrolet Data
-  description: >-
-    Force an immediate data refresh from the OnStar cloud for every configured
-    myChevrolet vehicle. Use after a command or when stale sensors need updating.
+  name: Refresh myChevrolet data
+  description: Request a telemetry update for configured GM vehicles, subject to polling cooldown and GM rate limits.

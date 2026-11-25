@@ -1,20 +1,12 @@
 {
-    "domain": "mychevrolet",
-    "name": "myChevrolet",
-    "codeowners": ["@Dvalin21"],
-    "config_flow": true,
-    "documentation": "https://github.com/Dvalin21/hass-mychevrolet",
-    "integration_type": "hub",
-    "iot_class": "cloud_polling",
-    "issue_tracker": "https://github.com/Dvalin21/hass-mychevrolet/issues",
-    "loggers": [
-        "mychevrolet",
-        "onyonstar"
-    ],
-    "requirements": [
-        "pyjwt>=2.8.0,<3.0.0",
-        "pyotp>=2.9.0,<3.0.0",
-        "aiofiles>=23.2.1,<24.0.0"
-    ],
-    "version": "0.1.0"
+  "domain": "mychevrolet",
+  "name": "myChevrolet",
+  "codeowners": ["@babgvant"],
+  "config_flow": true,
+  "documentation": "https://github.com/babgvant/hass-mychevrolet",
+  "integration_type": "hub",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/babgvant/hass-mychevrolet/issues",
+  "requirements": [],
+  "version": "0.2.0"
 }

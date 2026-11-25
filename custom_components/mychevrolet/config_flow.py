@@ -1,182 +1,250 @@
-"""Config flow for the myChevrolet integration."""
+"""Home Assistant setup, manual browser authorization and reauthentication."""
 
 from __future__ import annotations
 
-import logging
-import uuid
+import json
+from collections.abc import Mapping
 from typing import Any
+from uuid import uuid4
 
-import httpx
 import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.config_entries import ConfigFlowResult
-from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
-from homeassistant.core import HomeAssistant, callback
-from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers.httpx_client import get_async_client
-from .onyonstar import OnStar
+from homeassistant.core import callback
+from homeassistant.helpers import selector
 
+from .account import account_id, accounts
 from .const import (
-    CONF_CHEATER_MODE,
+    CONF_ACCOUNT,
+    CONF_CONTROLS,
+    CONF_DEVICE_ID,
+    CONF_LOCATION,
     CONF_SCAN_INTERVAL,
-    CONF_TOTP_SECRET,
-    CONF_VIN,
-    DEFAULT_CHEATER_MODE,
+    CONF_VEHICLES,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
     MIN_SCAN_INTERVAL,
 )
+from .onyonstar.auth import BrowserAttempt, GMAuth
+from .onyonstar.client import Account
+from .onyonstar.http import AuthError, CloudError
 
-_LOGGER = logging.getLogger(__name__)
-
-USER_SCHEMA = vol.Schema(
-    {
-        vol.Required(CONF_USERNAME): str,
-        vol.Required(CONF_PASSWORD): str,
-        vol.Required(CONF_VIN): str,
-        vol.Optional(CONF_TOTP_SECRET): str,
-        vol.Optional("device_id", default=""): str,
-        vol.Optional("onstar_pin", default=""): str,
-    }
+SECRET_INPUT = selector.TextSelector(
+    selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
 )
-
-OPTIONS_SCHEMA = vol.Schema(
-    {
-        vol.Required(CONF_SCAN_INTERVAL, default=DEFAULT_SCAN_INTERVAL): vol.All(
-            vol.Coerce(int), vol.Range(min=MIN_SCAN_INTERVAL, max=1440)
-        ),
-        vol.Required(CONF_CHEATER_MODE, default=DEFAULT_CHEATER_MODE): bool,
-    }
-)
-
-
-async def _validate(hass: HomeAssistant, user_input: dict[str, Any]) -> str:
-    """Authenticate and confirm the vehicle belongs to the account.
-
-    Returns the display title. Raises InvalidAuth / CannotConnect.
-    """
-    device_id = (user_input.get("device_id") or "").strip() or str(uuid.uuid4())
-    httpx_client = get_async_client(hass)
-    onstar = OnStar(
-        username=user_input[CONF_USERNAME],
-        password=user_input[CONF_PASSWORD],
-        device_id=device_id,
-        vin=user_input[CONF_VIN].strip().upper(),
-        totp_secret=user_input.get(CONF_TOTP_SECRET, ""),
-        onstar_pin=user_input.get("onstar_pin", ""),
-        http_client=httpx_client,
-    )
-    try:
-        await onstar.get_account_vehicles()
-        vehicle = onstar.get_vehicle_data()
-    except httpx.HTTPStatusError as err:
-        if err.response.status_code in (401, 403):
-            raise InvalidAuth(str(err)) from err
-        raise CannotConnect(str(err)) from err
-    except (httpx.RequestError, RuntimeError, ValueError, KeyError) as err:
-        text = str(err).lower()
-        if any(kw in text for kw in ("unauthorized", "access denied", "auth", "token", "login")):
-            raise InvalidAuth(str(err)) from err
-        raise CannotConnect(str(err)) from err
-    except HomeAssistantError:
-        raise
-    finally:
-        # httpx_client is HA's shared session; do not close it.
-        pass
-
-    name = (vehicle or {}).get("name") or user_input[CONF_VIN].strip().upper()
-    return f"{name} ({user_input[CONF_VIN].strip().upper()})"
 
 
 class MyChevroletConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
-    """Handle the initial config flow for myChevrolet."""
+    """Authenticate a GM account and select its vehicles."""
 
-    VERSION = 1
+    VERSION = 2
+    _attempt: BrowserAttempt | None = None
+    _candidate: Account | None = None
+    _vehicles: dict[str, str]
+    _reauth: bool = False
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Collect credentials and validate against the OnStar cloud."""
-        errors: dict[str, str] = {}
-        if user_input is not None:
-            try:
-                title = await _validate(self.hass, user_input)
-            except InvalidAuth:
-                errors["base"] = "invalid_auth"
-            except CannotConnect:
-                errors["base"] = "cannot_connect"
-            except Exception:
-                _LOGGER.exception("Unexpected error in myChevrolet config flow")
-                errors["base"] = "unknown"
-            else:
-                await self.async_set_unique_id(user_input[CONF_VIN].strip().upper())
-                self._abort_if_unique_id_configured()
-                device_id = (user_input.get("device_id") or "").strip() or str(
-                    uuid.uuid4()
-                )
-                return self.async_create_entry(
-                    title=title,
-                    data={
-                        CONF_USERNAME: user_input[CONF_USERNAME],
-                        CONF_PASSWORD: user_input[CONF_PASSWORD],
-                        CONF_VIN: user_input[CONF_VIN].strip().upper(),
-                        CONF_TOTP_SECRET: user_input.get(CONF_TOTP_SECRET, ""),
-                        "device_id": device_id,
-                        "onstar_pin": user_input.get("onstar_pin", ""),
-                    },
-                )
-
-        return self.async_show_form(
-            step_id="user", data_schema=USER_SCHEMA, errors=errors
+        """Offer browser sign-in or a locally obtained token set."""
+        return self.async_show_menu(
+            step_id="user", menu_options=["browser", "token_import"]
         )
 
     async def async_step_reauth(
-        self, entry_data: dict[str, Any]
+        self, entry_data: Mapping[str, Any]
     ) -> ConfigFlowResult:
-        """Kick off a reauth when the cloud rejects stored credentials."""
+        """Keep the existing entry, VINs and entity identities."""
+        self._reauth = True
         return await self.async_step_reauth_confirm()
 
-    async def async_step_reauth_confirm(
+    async def async_step_reauth_confirm(self) -> ConfigFlowResult:
+        """Present reauthentication methods."""
+        return self.async_show_menu(
+            step_id="reauth_confirm", menu_options=["browser", "token_import"]
+        )
+
+    async def _new_candidate(self) -> Account:
+        pool = accounts(self.hass)
+        device = str(uuid4())
+        if self._reauth:
+            entry = self._get_reauth_entry()
+            device = entry.data.get(CONF_DEVICE_ID, device)
+            if key := entry.data.get(CONF_ACCOUNT):
+                try:
+                    linked = await pool.get(key)
+                except AuthError:
+                    pass
+                else:
+                    device = linked.auth.device_id
+        return Account(GMAuth(pool.session, device))
+
+    async def async_step_browser(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Prompt the user to re-enter credentials for an existing entry."""
-        errors: dict[str, str] = {}
-        entry = self._get_reauth_entry()
-        entry_data = entry.data
+        """Display GM's authorization URL and accept its mobile redirect."""
+        error = None
+        if self._candidate is None:
+            self._candidate = await self._new_candidate()
+        metadata = None
+        try:
+            metadata = await self._candidate.auth.metadata()
+            if user_input is not None and self._attempt is not None:
+                await self._candidate.auth.authorize(
+                    self._attempt, user_input["redirect"]
+                )
+                return await self._discover()
+        except (AuthError, CloudError, OSError) as err:
+            error = "invalid_auth" if isinstance(err, AuthError) else "cannot_connect"
+            if metadata is None:
+                return await self.async_step_browser_unavailable()
+        if self._attempt is None or self._attempt.consumed or error:
+            self._attempt = BrowserAttempt()
+        return self.async_show_form(
+            step_id="browser",
+            data_schema=vol.Schema({vol.Required("redirect"): SECRET_INPUT}),
+            description_placeholders={
+                "url": self._attempt.url(metadata["authorization_endpoint"])
+            },
+            errors={"base": error} if error else {},
+        )
+
+    async def async_step_browser_unavailable(self) -> ConfigFlowResult:
+        """Offer a retry or the independent token import path."""
+        return self.async_show_menu(
+            step_id="browser_unavailable", menu_options=["browser", "token_import"]
+        )
+
+    async def async_step_token_import(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Import a Microsoft refresh token; confirm it directly with GM."""
+        error = None
         if user_input is not None:
             try:
-                await _validate(self.hass, {**entry_data, **user_input})
-            except InvalidAuth:
-                errors["base"] = "invalid_auth"
-            except CannotConnect:
-                errors["base"] = "cannot_connect"
-            except Exception:
-                _LOGGER.exception("Unexpected error during myChevrolet reauth")
-                errors["base"] = "unknown"
-            else:
-                device_id = (user_input.get("device_id") or "").strip() or entry.data.get(
-                    "device_id", str(uuid.uuid4())
+                value = user_input["tokens"].strip()
+                if not value or len(value) > 65536:
+                    raise AuthError
+                tokens = (
+                    json.loads(value)
+                    if value.startswith("{")
+                    else {"refresh_token": value}
                 )
-                self.async_update_reload_and_abort(
-                    entry,
-                    data={
-                        **entry.data,
-                        CONF_USERNAME: user_input[CONF_USERNAME],
-                        CONF_PASSWORD: user_input[CONF_PASSWORD],
-                        CONF_TOTP_SECRET: user_input.get(CONF_TOTP_SECRET, entry.data.get(CONF_TOTP_SECRET, "")),
-                        "device_id": device_id,
-                    },
-                )
-                # async_update_reload_and_abort returns None; never reached.
-                return self.async_abort(reason="reauth_successful")
-
+                if not isinstance(tokens, dict):
+                    raise AuthError
+                self._candidate = await self._new_candidate()
+                await self._candidate.auth.import_tokens(tokens)
+                return await self._discover()
+            except AuthError, ValueError:
+                error = "invalid_auth"
+            except CloudError, OSError:
+                error = "cannot_connect"
         return self.async_show_form(
-            step_id="reauth_confirm",
+            step_id="token_import",
+            data_schema=vol.Schema({vol.Required("tokens"): SECRET_INPUT}),
+            errors={"base": error} if error else {},
+        )
+
+    async def _discover(self) -> ConfigFlowResult:
+        assert self._candidate is not None and self._candidate.auth.subject is not None
+        key = account_id(self._candidate.auth.subject)
+        if self._reauth:
+            entry = self._get_reauth_entry()
+            if entry.data.get(CONF_ACCOUNT, key) != key:
+                return self.async_abort(reason="wrong_account")
+        else:
+            await self.async_set_unique_id(key)
+            self._abort_if_unique_id_configured()
+        try:
+            records = await self._candidate.vehicles()
+        except CloudError, OSError:
+            return await self.async_step_retry_discovery()
+        if self._reauth:
+            if not set(entry.data[CONF_VEHICLES]).issubset(records):
+                return self.async_abort(reason="wrong_account")
+            await accounts(self.hass).link(self._candidate)
+            for other in self._async_current_entries():
+                if (
+                    other.entry_id != entry.entry_id
+                    and other.data.get(CONF_ACCOUNT) == key
+                ):
+                    self.hass.config_entries.async_schedule_reload(other.entry_id)
+            data = {CONF_ACCOUNT: key, CONF_VEHICLES: entry.data[CONF_VEHICLES]}
+            return self.async_update_reload_and_abort(entry, data=data)
+
+        claimed = {
+            vin
+            for entry in self._async_current_entries()
+            for vin in entry.data.get(CONF_VEHICLES, [entry.data.get("vin")])
+        }
+        self._vehicles = {
+            vin: vehicle_label(record, vin)
+            for vin, record in records.items()
+            if vin not in claimed
+        }
+        if not self._vehicles:
+            return self.async_abort(reason="no_new_vehicles")
+        return await self.async_step_vehicles()
+
+    async def async_step_retry_discovery(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Retry discovery without starting a second OAuth grant."""
+        if user_input is not None:
+            try:
+                return await self._discover()
+            except AuthError:
+                return self.async_abort(reason="authorization_expired")
+        return self.async_show_form(
+            step_id="retry_discovery", data_schema=vol.Schema({})
+        )
+
+    async def async_step_vehicles(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Choose the vehicles that belong to this config entry."""
+        errors = {}
+        if user_input is not None:
+            selected = list(dict.fromkeys(user_input[CONF_VEHICLES]))
+            if selected and all(vin in self._vehicles for vin in selected):
+                claimed = {
+                    vin
+                    for entry in self._async_current_entries()
+                    for vin in entry.data.get(CONF_VEHICLES, [entry.data.get("vin")])
+                }
+                if claimed.intersection(selected):
+                    return self.async_abort(reason="already_configured")
+                assert self._candidate is not None
+                try:
+                    key = await accounts(self.hass).link(self._candidate)
+                except CloudError, OSError:
+                    errors["base"] = "cannot_connect"
+                else:
+                    title = (
+                        self._vehicles[selected[0]]
+                        if len(selected) == 1
+                        else "myChevrolet"
+                    )
+                    return self.async_create_entry(
+                        title=title, data={CONF_ACCOUNT: key, CONF_VEHICLES: selected}
+                    )
+            else:
+                errors["base"] = "select_vehicles"
+        return self.async_show_form(
+            step_id="vehicles",
             data_schema=vol.Schema(
                 {
-                    vol.Required(CONF_USERNAME, default=entry_data.get(CONF_USERNAME)): str,
-                    vol.Required(CONF_PASSWORD): str,
-                    vol.Optional(CONF_TOTP_SECRET, default=entry_data.get(CONF_TOTP_SECRET, "")): str,
+                    vol.Required(
+                        CONF_VEHICLES, default=list(self._vehicles)
+                    ): selector.SelectSelector(
+                        selector.SelectSelectorConfig(
+                            multiple=True,
+                            options=[
+                                {"label": title, "value": vin}
+                                for vin, title in self._vehicles.items()
+                            ],
+                        )
+                    )
                 }
             ),
             errors=errors,
@@ -187,28 +255,42 @@ class MyChevroletConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     def async_get_options_flow(
         config_entry: config_entries.ConfigEntry,
     ) -> config_entries.OptionsFlow:
-        """Return the options flow."""
+        """Provide polling and privacy settings."""
         return MyChevroletOptionsFlow()
 
 
-class MyChevroletOptionsFlow(config_entries.OptionsFlow):
-    """Handle myChevrolet options (poll interval, cheater mode)."""
+def vehicle_label(vehicle: dict[str, Any], vin: str) -> str:
+    """Label a vehicle without using its full VIN as the entry title."""
+    label = vehicle.get("name") or vehicle.get("model") or "GM vehicle"
+    return f"{label} ({vin[-4:]})"
+
+
+class MyChevroletOptionsFlow(config_entries.OptionsFlowWithReload):
+    """Configure an entry's polling, privacy and remote actions."""
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Persist options."""
+        """Update options and reload the selected platforms."""
         if user_input is not None:
             return self.async_create_entry(title="", data=user_input)
+        current = self.config_entry.options
         return self.async_show_form(
             step_id="init",
-            data_schema=OPTIONS_SCHEMA,
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_SCAN_INTERVAL,
+                        default=current.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL),
+                    ): vol.All(
+                        vol.Coerce(int), vol.Range(min=MIN_SCAN_INTERVAL, max=1440)
+                    ),
+                    vol.Required(
+                        CONF_LOCATION, default=current.get(CONF_LOCATION, False)
+                    ): bool,
+                    vol.Required(
+                        CONF_CONTROLS, default=current.get(CONF_CONTROLS, False)
+                    ): bool,
+                }
+            ),
         )
-
-
-class InvalidAuth(HomeAssistantError):
-    """Credentials were rejected by the OnStar cloud."""
-
-
-class CannotConnect(HomeAssistantError):
-    """The OnStar cloud could not be reached."""

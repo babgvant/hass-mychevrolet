@@ -1,266 +1,220 @@
-"""Unit tests for the vendored onyonstar library.
+"""Exercise the OAuth trust boundary without contacting GM."""
 
-Tests JWT signature verification, JWKS fetching/caching, and token file
-permissions — the security-critical parts of the OnStar client.
-"""
-
-from __future__ import annotations
-
+import asyncio
 import json
-import os
-import stat
 import time
-from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 import jwt
 import pytest
-from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
-from custom_components.mychevrolet.onyonstar.auth.gm_auth import GMAuth
-from custom_components.mychevrolet.onyonstar.auth.constants import OIDC_ISSUER
+from custom_components.mychevrolet.onyonstar.api import OnStarAPIClient
+from custom_components.mychevrolet.onyonstar.auth import BrowserAttempt, GMAuth, gm_auth
+from custom_components.mychevrolet.onyonstar.auth.constants import (
+    AUTH_REDIRECT_URI,
+    CLIENT_ID,
+    DISCOVERY_URL,
+    GM_TOKEN_ENDPOINT,
+    OIDC_ISSUER,
+)
+from custom_components.mychevrolet.onyonstar.http import (
+    AuthError,
+    CloudError,
+    retry_delay,
+)
+
+AUTHORIZE = "https://custlogin.gm.com/authorize"
+TOKEN = "https://custlogin.gm.com/token"
+KEYS = "https://custlogin.gm.com/keys"
 
 
-def _make_rsa_keypair() -> tuple:
-    """Generate an RSA key pair and return (private_key_pem, public_key_jwk_dict)."""
-    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    private_pem = private_key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption(),
-    )
-    public_key = private_key.public_key()
-    public_pem = public_key.public_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PublicFormat.SubjectPublicKeyInfo,
-    )
-
-    # Build a JWKS entry from the public key
-    from jwt.algorithms import RSAAlgorithm
-
-    jwk = RSAAlgorithm.to_jwk(public_key)
-    jwk_dict = json.loads(jwk)
-    jwk_dict["kid"] = "test-kid-1"
-    jwk_dict["use"] = "sig"
-
-    return private_pem, jwk_dict
+@pytest.fixture
+def key():
+    """Generate a disposable signing key."""
+    return rsa.generate_private_key(public_exponent=65537, key_size=2048)
 
 
-def _make_signed_jwt(private_pem: bytes, payload: dict, kid: str = "test-kid-1") -> str:
-    """Sign a JWT payload with the given private key."""
+def signed(key, **claims):
     return jwt.encode(
-        payload,
-        private_pem,
+        {
+            "iss": OIDC_ISSUER,
+            "aud": CLIENT_ID,
+            "exp": int(time.time()) + 3600,
+            "sub": "synthetic-subject",
+            **claims,
+        },
+        key,
         algorithm="RS256",
-        headers={"kid": kid},
+        headers={"kid": "test-key"},
     )
 
 
-class TestJWKSCaching:
-    """Test JWKS fetch and cache behavior."""
+@pytest.fixture
+def endpoint(monkeypatch, key):
+    """Provide signed tokens and record fake GM requests."""
+    calls = []
+    responses = {}
+    public = json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(key.public_key()))
+    defaults = {
+        DISCOVERY_URL: {
+            "issuer": OIDC_ISSUER,
+            "authorization_endpoint": AUTHORIZE,
+            "token_endpoint": TOKEN,
+            "jwks_uri": KEYS,
+        },
+        KEYS: {"keys": [{**public, "kid": "test-key", "use": "sig"}]},
+        TOKEN: {"access_token": signed(key), "refresh_token": "rotated"},
+        GM_TOKEN_ENDPOINT: {"access_token": "gm-service-bearer", "expires_in": 600},
+    }
 
-    @pytest.fixture
-    def auth(self, tmp_path: Path) -> GMAuth:
-        config = {
-            "username": "test@example.com",
-            "password": "secret",
-            "device_id": "test-device",
-            "totp_key": "JBSWY3DPEHPK3PXP",
-            "token_location": str(tmp_path),
-        }
-        return GMAuth(config, debug=False)
+    async def request(session, method, url, host, **kwargs):
+        calls.append((url, kwargs))
+        await asyncio.sleep(0)
+        response = responses.get(url, defaults[url])
+        if isinstance(response, Exception):
+            raise response
+        return response
 
-    @pytest.mark.asyncio
-    async def test_fetch_jwks_caches_result(self, auth: GMAuth) -> None:
-        """Second call to _fetch_jwks returns cached data without re-fetching."""
-        jwks_data = {"keys": [{"kid": "test-kid-1", "kty": "RSA"}]}
-
-        mock_resp = MagicMock()
-        mock_resp.json.return_value = jwks_data
-        mock_resp.raise_for_status = MagicMock()
-
-        auth._make_request = AsyncMock(return_value=mock_resp)
-        auth._jwks_uri = "https://example.com/.well-known/jwks.json"
-
-        # First call fetches
-        result1 = await auth._fetch_jwks()
-        assert result1 == jwks_data
-        assert auth._make_request.await_count == 1
-
-        # Second call returns from cache
-        result2 = await auth._fetch_jwks()
-        assert result2 == jwks_data
-        assert auth._make_request.await_count == 1  # still 1, cached
-
-    @pytest.mark.asyncio
-    async def test_fetch_jwks_expires_after_ttl(self, auth: GMAuth) -> None:
-        """JWKS cache expires after _jwks_ttl seconds."""
-        jwks_data = {"keys": [{"kid": "test-kid-1", "kty": "RSA"}]}
-
-        mock_resp = MagicMock()
-        mock_resp.json.return_value = jwks_data
-        mock_resp.raise_for_status = MagicMock()
-
-        auth._make_request = AsyncMock(return_value=mock_resp)
-        auth._jwks_uri = "https://example.com/.well-known/jwks.json"
-
-        await auth._fetch_jwks()
-        assert auth._make_request.await_count == 1
-
-        # Simulate TTL expiry
-        auth._jwks_fetched_at = time.time() - auth._jwks_ttl - 1
-
-        await auth._fetch_jwks()
-        assert auth._make_request.await_count == 2  # refetched
-
-    @pytest.mark.asyncio
-    async def test_fetch_jwks_no_uri_returns_none(self, auth: GMAuth) -> None:
-        """_fetch_jwks returns None when no JWKS URI is configured."""
-        auth._jwks_uri = None
-        result = await auth._fetch_jwks()
-        assert result is None
+    monkeypatch.setattr(gm_auth, "request_json", request)
+    return calls, responses
 
 
-class TestVerifyJWT:
-    """Test JWT signature verification."""
-
-    @pytest.fixture
-    def auth(self, tmp_path: Path) -> GMAuth:
-        config = {
-            "username": "test@example.com",
-            "password": "secret",
-            "device_id": "test-device",
-            "totp_key": "JBSWY3DPEHPK3PXP",
-            "token_location": str(tmp_path),
-        }
-        return GMAuth(config, debug=False)
-
-    @pytest.mark.asyncio
-    async def test_verify_jwt_valid_token(self, auth: GMAuth) -> None:
-        """A properly signed JWT with matching kid verifies successfully."""
-        private_pem, jwk_dict = _make_rsa_keypair()
-        payload = {
-            "vehs": [{"vin": "1HGABC1234567890X"}],
-            "uid": "test@example.com",
-            "iss": OIDC_ISSUER,
-        }
-        token = _make_signed_jwt(private_pem, payload)
-
-        # Mock JWKS fetch to return our public key
-        auth._fetch_jwks = AsyncMock(return_value={"keys": [jwk_dict]})
-
-        decoded = await auth.verify_jwt(token, issuer=OIDC_ISSUER)
-        assert decoded["vehs"][0]["vin"] == "1HGABC1234567890X"
-        assert decoded["uid"] == "test@example.com"
-
-    @pytest.mark.asyncio
-    async def test_verify_jwt_wrong_kid_raises(self, auth: GMAuth) -> None:
-        """JWT with a kid not in JWKS raises ValueError."""
-        private_pem, jwk_dict = _make_rsa_keypair()
-        # Remove the kid we set, so it won't match
-        jwk_dict.pop("kid", None)
-        payload = {
-            "vehs": [],
-            "uid": "test@example.com",
-            "iss": OIDC_ISSUER,
-        }
-        token = _make_signed_jwt(private_pem, payload, kid="missing-kid")
-
-        auth._fetch_jwks = AsyncMock(return_value={"keys": [jwk_dict]})
-
-        with pytest.raises(ValueError, match="No matching JWKS key found"):
-            await auth.verify_jwt(token, issuer=OIDC_ISSUER)
-
-    @pytest.mark.asyncio
-    async def test_verify_jwt_no_kid_raises(self, auth: GMAuth) -> None:
-        """JWT without a kid header raises ValueError."""
-        private_pem, _ = _make_rsa_keypair()
-        payload = {
-            "vehs": [],
-            "uid": "test@example.com",
-            "iss": OIDC_ISSUER,
-        }
-        token = jwt.encode(payload, private_pem, algorithm="RS256")  # no kid header
-
-        auth._fetch_jwks = AsyncMock(return_value={"keys": []})
-
-        with pytest.raises(ValueError, match="missing 'kid' header"):
-            await auth.verify_jwt(token, issuer=OIDC_ISSUER)
-
-    @pytest.mark.asyncio
-    async def test_verify_jwt_bad_signature_raises(self, auth: GMAuth) -> None:
-        """JWT signed with a different key raises ValueError."""
-        private_pem_a, jwk_dict_a = _make_rsa_keypair()
-        private_pem_b, jwk_dict_b = _make_rsa_keypair()
-
-        payload = {
-            "vehs": [],
-            "uid": "test@example.com",
-            "iss": OIDC_ISSUER,
-        }
-        # Sign with key A but present JWKS with key B's public key
-        token = _make_signed_jwt(private_pem_a, payload)
-
-        auth._fetch_jwks = AsyncMock(return_value={"keys": [jwk_dict_b]})
-
-        with pytest.raises(
-            (jwt.InvalidSignatureError, ValueError),
-        ):
-            await auth.verify_jwt(token, issuer=OIDC_ISSUER)
-
-    @pytest.mark.asyncio
-    async def test_verify_jwt_no_jwks_raises(self, auth: GMAuth) -> None:
-        """When JWKS is unavailable, verify_jwt raises ValueError."""
-        private_pem, _ = _make_rsa_keypair()
-        payload = {
-            "vehs": [],
-            "uid": "test@example.com",
-            "iss": OIDC_ISSUER,
-        }
-        token = _make_signed_jwt(private_pem, payload)
-
-        auth._fetch_jwks = AsyncMock(return_value=None)
-
-        with pytest.raises(ValueError, match="JWKS unavailable"):
-            await auth.verify_jwt(token, issuer=OIDC_ISSUER)
+def redirect(attempt, **params):
+    return f"{AUTH_REDIRECT_URI}?{urlencode({'code': 'test-code', 'state': attempt.state, **params})}"
 
 
-class TestTokenFilePermissions:
-    """Test that token files are created with 0o600 permissions."""
+def test_pkce_and_redirect_validation():
+    attempt = BrowserAttempt()
+    query = parse_qs(urlsplit(attempt.url(AUTHORIZE)).query)
+    assert query["code_challenge_method"] == ["S256"]
+    assert query["nonce"] == [attempt.nonce]
+    assert query["code_challenge"] != [attempt.verifier]
+    for invalid in (
+        redirect(attempt, state="other"),
+        redirect(attempt) + "&state=duplicate",
+        redirect(attempt) + "#fragment",
+        redirect(attempt).replace("://auth", "://evil"),
+    ):
+        with pytest.raises(AuthError):
+            attempt.code(invalid)
+    assert attempt.code(redirect(attempt)) == "test-code"
+    with pytest.raises(AuthError):
+        attempt.code(redirect(attempt))
+    expired = BrowserAttempt(deadline=-1)
+    with pytest.raises(AuthError):
+        expired.code(redirect(expired))
 
-    @pytest.fixture
-    def auth(self, tmp_path: Path) -> GMAuth:
-        config = {
-            "username": "test@example.com",
-            "password": "secret",
-            "device_id": "test-device",
-            "totp_key": "JBSWY3DPEHPK3PXP",
-            "token_location": str(tmp_path),
-        }
-        return GMAuth(config, debug=False)
 
-    @pytest.mark.asyncio
-    async def test_save_tokens_sets_0600_permissions(self, auth: GMAuth) -> None:
-        """_save_tokens writes token files with owner-only read/write."""
-        token_set = {
-            "access_token": "test-access-token",
-            "expires_in": 3600,
-            "expires_at": int(time.time()) + 3600,
-        }
-        auth._current_gm_token = {
-            "access_token": "test-gm-token",
-            "expires_in": 3600,
-            "expires_at": int(time.time()) + 3600,
-        }
+async def test_interactive_exchange_binds_nonce_and_redirect(endpoint, key):
+    calls, responses = endpoint
+    attempt = BrowserAttempt()
+    responses[TOKEN] = {
+        "access_token": signed(key),
+        "id_token": signed(key, nonce=attempt.nonce),
+        "refresh_token": "interactive-refresh",
+    }
+    auth = GMAuth(None, "stable-device")
+    await auth.authorize(attempt, redirect(attempt))
+    assert auth.subject == "synthetic-subject"
+    params = next(data["data"] for url, data in calls if url == TOKEN)
+    assert params["redirect_uri"] == AUTH_REDIRECT_URI
+    assert params["code_verifier"] == attempt.verifier
+    assert await auth.access_token() == "gm-service-bearer"
 
-        await auth._save_tokens(token_set)
 
-        ms_stat = os.stat(auth._ms_token_path)
-        gm_stat = os.stat(auth._gm_token_path)
+@pytest.mark.parametrize(
+    "claims",
+    [
+        {"iss": "https://unexpected.example"},
+        {"aud": "wrong-client"},
+        {"exp": 1},
+        {"sub": 42},
+    ],
+)
+async def test_rejects_invalid_oidc_claims(endpoint, key, claims):
+    _, responses = endpoint
+    responses[TOKEN] = {"access_token": signed(key, **claims), "refresh_token": "next"}
+    with pytest.raises(AuthError):
+        await GMAuth(None, "device").import_tokens({"refresh_token": "initial"})
 
-        ms_mode = stat.S_IMODE(ms_stat.st_mode)
-        gm_mode = stat.S_IMODE(gm_stat.st_mode)
 
-        assert ms_mode == 0o600, f"Expected 0o600, got {oct(ms_mode)}"
-        assert gm_mode == 0o600, f"Expected 0o600, got {oct(gm_mode)}"
+async def test_rejects_bad_signature_and_nonce(endpoint, key):
+    _, responses = endpoint
+    auth = GMAuth(None, "device")
+    other_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    responses[TOKEN] = {"access_token": signed(other_key), "refresh_token": "next"}
+    with pytest.raises(AuthError):
+        await auth.import_tokens({"refresh_token": "initial"})
+    attempt = BrowserAttempt()
+    responses[TOKEN] = {
+        "access_token": signed(key),
+        "id_token": signed(key, nonce="wrong"),
+        "refresh_token": "next",
+    }
+    with pytest.raises(AuthError):
+        await auth.authorize(attempt, redirect(attempt))
+
+
+async def test_concurrent_refresh_rotation_and_restart(endpoint):
+    calls, responses = endpoint
+    stored = []
+
+    async def save(value):
+        await asyncio.sleep(0)
+        stored.append(value)
+
+    auth = GMAuth(
+        None, "stable-device", "initial", subject="synthetic-subject", save=save
+    )
+    assert (
+        await asyncio.gather(*(auth.access_token() for _ in range(8)))
+        == ["gm-service-bearer"] * 8
+    )
+    assert stored == ["rotated"]
+    assert [url for url, _ in calls].count(GM_TOKEN_ENDPOINT) == 1
+    assert [url for url, _ in calls].count(TOKEN) == 1
+    responses[TOKEN] = {**responses.get(TOKEN, {}), "access_token": auth._ms_token}
+    restart = GMAuth(None, "stable-device", stored[-1], subject=auth.subject, save=save)
+    await restart.access_token()
+    assert [
+        kwargs["data"]["refresh_token"] for url, kwargs in calls if url == TOKEN
+    ] == ["initial", "rotated"]
+
+
+async def test_import_exchanges_refresh_and_disregards_supplied_claims(endpoint):
+    auth = GMAuth(None, "stable-device")
+    await auth.import_tokens({"refresh_token": "initial", "access_token": "untrusted"})
+    assert auth.subject == "synthetic-subject"
+    assert auth.refresh_token == "rotated"
+
+
+async def test_revocation_stops_refresh(endpoint):
+    calls, responses = endpoint
+    responses[TOKEN] = CloudError(400, invalid_grant=True)
+    auth = GMAuth(None, "device", "revoked")
+    for _ in range(2):
+        with pytest.raises(AuthError):
+            await auth.access_token()
+    assert [url for url, _ in calls].count(TOKEN) == 1
+
+
+@pytest.mark.parametrize(
+    "address",
+    [
+        "https://bad.example/api/v1",
+        "https://na-mobile-api.gm.com@bad.example/api/v1",
+        "//bad.example/api/v1",
+        "https://na-mobile-api.gm.com:444/api/v1",
+        "http://na-mobile-api.gm.com/api/v1",
+    ],
+)
+def test_api_disallows_foreign_bearer_destinations(address):
+    with pytest.raises(CloudError):
+        OnStarAPIClient._url(address)
+
+
+def test_retry_after_parsing():
+    assert retry_delay("90") == 90
+    assert retry_delay("Wed, 01 Jan 2099 00:00:00 GMT") > 0
+    assert retry_delay("NaN") == 0

@@ -1,55 +1,86 @@
-"""Binary sensor platform for myChevrolet."""
-
-from __future__ import annotations
-
-import logging
+"""EV connection, charging location and discharge flags."""
 
 from homeassistant.components.binary_sensor import (
     BinarySensorDeviceClass,
     BinarySensorEntity,
 )
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .const import DOMAIN
-from .entity import MyChevroletEntity
-from .helpers import get_diagnostic_value, get_diagnostics, is_ev
+from .coordinator import (
+    MyChevroletConfigEntry,
+    MyChevroletDataUpdateCoordinator,
+    Sample,
+)
+from .entity import TelemetryEntity
+from .sensor import PLUG, select_sample, text
 
-_LOGGER = logging.getLogger(__name__)
+FLAGS = {
+    "charge_location_set": "clocSet",
+    "at_charge_location": "clocAt",
+    "discharge_enabled": "disEnabled",
+}
 
 
 async def async_setup_entry(
-    hass, entry, async_add_entities
-) -> None:  # type: ignore[no-untyped-def]
-    """Set up binary sensors (currently: plugged in, EV only)."""
-    coordinator: DataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id][
-        "coordinator"
-    ]
-    vin = entry.data["vin"]
-
-    diagnostics = get_diagnostics(coordinator.data)
-    if not is_ev(diagnostics):
-        async_add_entities([])
-        return
-
-    sensors: list[BinarySensorEntity] = [MyChevroletPluggedIn(coordinator, vin)]
-    async_add_entities(sensors)
+    hass: HomeAssistant,
+    entry: MyChevroletConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Add binary entities once their backing capabilities are known."""
+    for coordinator in entry.runtime_data.values():
+        _watch_flags(entry, coordinator, async_add_entities)
 
 
-class MyChevroletPluggedIn(MyChevroletEntity, BinarySensorEntity):
-    """True while the vehicle reports it is plugged in and charging."""
+def _watch_flags(
+    entry: MyChevroletConfigEntry,
+    coordinator: MyChevroletDataUpdateCoordinator,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    added = set()
 
-    _attr_name = "Plugged In"
-    _attr_device_class = BinarySensorDeviceClass.PLUG
+    @callback
+    def add_supported() -> None:
+        entities = []
+        if "plug_state" not in added and (
+            "EV PLUG STATE" in coordinator.onstar.diagnostics_supported
+            or select_sample(coordinator, PLUG) is not None
+        ):
+            added.add("plug_state")
+            entities.append(VehicleFlag(coordinator, "plug_state"))
+        for key, field in FLAGS.items():
+            if key not in added and field in coordinator.ev:
+                added.add(key)
+                entities.append(VehicleFlag(coordinator, key))
+        if entities:
+            async_add_entities(entities)
 
-    def __init__(self, coordinator, vin):  # type: ignore[no-untyped-def]
-        super().__init__(coordinator, "plug_state", "Plugged In")
+    add_supported()
+    entry.async_on_unload(coordinator.async_add_listener(add_supported))
+
+
+class VehicleFlag(TelemetryEntity, BinarySensorEntity):
+    """A reported vehicle setting or connection state."""
+
+    def __init__(self, coordinator: MyChevroletDataUpdateCoordinator, key: str) -> None:
+        super().__init__(coordinator, key)
+        self.key = key
+        if key == "plug_state":
+            self._attr_device_class = BinarySensorDeviceClass.PLUG
+
+    @property
+    def sample(self) -> Sample | None:
+        """Use the source backing this flag."""
+        if self.key == "plug_state":
+            return select_sample(self.coordinator, PLUG)
+        return self.coordinator.ev.get(FLAGS[self.key])
 
     @property
     def is_on(self) -> bool | None:
-        """Return True when EV PLUG STATE is plugged."""
-        value = get_diagnostic_value(
-            get_diagnostics(self.coordinator.data), "EV PLUG STATE"
-        )
-        if value is None:
+        """Preserve explicitly reported false and unknown states."""
+        if self.sample is None:
             return None
-        return str(value).lower() == "plugged"
+        value = self.sample.value
+        if self.key == "plug_state":
+            return {"plugged": True, "unplugged": False}.get(text(value))
+        return value if isinstance(value, bool) else None

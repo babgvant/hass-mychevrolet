@@ -1,19 +1,5 @@
-"""
-Python adaptation of GMAuth.ts from the OnStarJS project.
-This module focuses exclusively on performing the Microsoft B2C + GM token
-exchange so we can retrieve a valid GM API OAuth token.
-"""
+"""GM's OAuth client."""
 
-from .types import Vehicle, DecodedPayload, GMAuthConfig, TokenSet, GMAPITokenResponse
-from .gm_auth import GMAuth
-from .api import get_gm_api_jwt
+from .gm_auth import BrowserAttempt, GMAuth
 
-__all__ = [
-    "GMAuth", 
-    "get_gm_api_jwt",
-    "GMAPITokenResponse",
-    "Vehicle",
-    "DecodedPayload",
-    "GMAuthConfig",
-    "TokenSet"
-] 
+__all__ = ["BrowserAttempt", "GMAuth"]

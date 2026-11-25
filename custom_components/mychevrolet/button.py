@@ -1,69 +1,54 @@
-"""Button platform for myChevrolet remote commands."""
-
-from __future__ import annotations
-
-import logging
+"""Telemetry refresh and opted-in OnStar action buttons."""
 
 from homeassistant.components.button import ButtonEntity
-from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+from homeassistant.const import EntityCategory
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .const import DOMAIN
+from .coordinator import MyChevroletConfigEntry, MyChevroletDataUpdateCoordinator
 from .entity import MyChevroletEntity
 
-_LOGGER = logging.getLogger(__name__)
-
-# Maps a button key to the coordinator coroutine that runs it.
-_BUTTON_COMMANDS = {
-    "refresh_data": "async_refresh_data",
-    "honk_flash": "async_honk_flash",
-    "remote_start": "async_remote_start",
-    "remote_stop": "async_remote_stop",
+COMMANDS = {
+    "honk_flash": "alert",
+    "remote_start": "start",
+    "remote_stop": "cancelStart",
 }
 
 
 async def async_setup_entry(
-    hass, entry, async_add_entities
-) -> None:  # type: ignore[no-untyped-def]
-    """Set up a button for each remote command the vehicle supports."""
-    coordinator: DataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id][
-        "coordinator"
-    ]
-    vin = entry.data["vin"]
-
-    buttons: list[ButtonEntity] = [
-        MyChevroletButton(coordinator, vin, "refresh_data", "Update Data", "refresh"),
-    ]
-    if coordinator.command_available("alert"):
-        buttons.append(
-            MyChevroletButton(coordinator, vin, "honk_flash", "Honk & Flash", "flash")
+    hass: HomeAssistant,
+    entry: MyChevroletConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Register one refresh button and authorized controls for each vehicle."""
+    buttons = []
+    for coordinator in entry.runtime_data.values():
+        buttons.append(MyChevroletButton(coordinator, "refresh_data"))
+        buttons.extend(
+            MyChevroletButton(coordinator, key, command)
+            for key, command in COMMANDS.items()
+            if coordinator.command_available(command)
         )
-    if coordinator.command_available("start"):
-        buttons.append(
-            MyChevroletButton(coordinator, vin, "remote_start", "Remote Start", "play")
-        )
-    if coordinator.command_available("cancelStart"):
-        buttons.append(
-            MyChevroletButton(coordinator, vin, "remote_stop", "Remote Stop", "stop")
-        )
-
     async_add_entities(buttons)
 
 
 class MyChevroletButton(MyChevroletEntity, ButtonEntity):
-    """Trigger a single remote command."""
+    """Request a refresh or an allowed action."""
 
-    def __init__(self, coordinator, vin, key, name, icon):  # type: ignore[no-untyped-def]
-        super().__init__(coordinator, key, name)
-        self._attr_icon = icon
-        self._coro_name = _BUTTON_COMMANDS[key]
+    def __init__(
+        self,
+        coordinator: MyChevroletDataUpdateCoordinator,
+        key: str,
+        command: str | None = None,
+    ) -> None:
+        super().__init__(coordinator, key)
+        self.command = command
+        if command is None:
+            self._attr_entity_category = EntityCategory.DIAGNOSTIC
 
     async def async_press(self) -> None:
-        """Run the mapped coordinator command."""
-        coro = getattr(self.coordinator, self._coro_name)()
-        try:
-            await coro
-        except HomeAssistantError:
-            raise
-        except Exception as err:
-            raise HomeAssistantError(f"{self._attr_name} failed: {err}") from err
+        """Dispatch explicitly to the corresponding coordinator action."""
+        if self.command is None:
+            await self.coordinator.async_refresh_data()
+        else:
+            await self.coordinator.async_execute_command(self.command)

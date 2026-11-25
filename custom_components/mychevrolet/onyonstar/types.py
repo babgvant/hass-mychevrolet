@@ -1,10 +1,12 @@
 """Type definitions for OnStar client."""
+
 from enum import Enum
-from typing import List, TypedDict
+from typing import TypedDict
 
 
 class CommandResponseStatus(Enum):
     """Command response status values."""
+
     SUCCESS = "success"
     FAILURE = "failure"
     IN_PROGRESS = "inProgress"
@@ -13,24 +15,28 @@ class CommandResponseStatus(Enum):
 
 class AlertRequestAction(Enum):
     """Alert request actions."""
+
     HONK = "Honk"
     FLASH = "Flash"
 
 
 class AlertRequestOverride(Enum):
     """Alert request overrides."""
+
     DOOR_OPEN = "DoorOpen"
     IGNITION_ON = "IgnitionOn"
 
 
 class ChargeOverrideMode(Enum):
     """Charge override modes."""
+
     CHARGE_NOW = "CHARGE_NOW"
     CANCEL_OVERRIDE = "CANCEL_OVERRIDE"
 
 
 class ChargingProfileChargeMode(Enum):
     """Charging profile charge modes."""
+
     DEFAULT_IMMEDIATE = "DEFAULT_IMMEDIATE"
     IMMEDIATE = "IMMEDIATE"
     DEPARTURE_BASED = "DEPARTURE_BASED"
@@ -40,6 +46,7 @@ class ChargingProfileChargeMode(Enum):
 
 class ChargingProfileRateType(Enum):
     """Charging profile rate types."""
+
     OFFPEAK = "OFFPEAK"
     MIDPEAK = "MIDPEAK"
     PEAK = "PEAK"
@@ -47,6 +54,7 @@ class ChargingProfileRateType(Enum):
 
 class DiagnosticRequestItem(Enum):
     """Diagnostic request items."""
+
     AMBIENT_AIR_TEMPERATURE = "AMBIENT AIR TEMPERATURE"
     ENGINE_COOLANT_TEMP = "ENGINE COOLANT TEMP"
     ENGINE_RPM = "ENGINE RPM"
@@ -76,33 +84,39 @@ class DiagnosticRequestItem(Enum):
 
 class DoorRequestOptions(TypedDict, total=False):
     """Door request options."""
+
     delay: int
 
 
 class TrunkRequestOptions(TypedDict, total=False):
     """Trunk request options."""
+
     delay: int
 
 
 class AlertRequestOptions(TypedDict, total=False):
     """Alert request options."""
-    action: List[AlertRequestAction]
+
+    action: list[AlertRequestAction]
     delay: int
     duration: int
-    override: List[AlertRequestOverride]
+    override: list[AlertRequestOverride]
 
 
 class ChargeOverrideOptions(TypedDict, total=False):
     """Charge override options."""
+
     mode: ChargeOverrideMode
 
 
 class SetChargingProfileRequestOptions(TypedDict, total=False):
     """Set charging profile request options."""
+
     charge_mode: ChargingProfileChargeMode
     rate_type: ChargingProfileRateType
 
 
 class DiagnosticsRequestOptions(TypedDict, total=False):
     """Diagnostics request options."""
-    diagnostic_item: List[str] 
+
+    diagnostic_item: list[str]

@@ -1,67 +1,43 @@
-"""Device tracker platform for myChevrolet (vehicle GPS location)."""
-
-from __future__ import annotations
-
-import logging
-from typing import Any
+"""Optional vehicle GPS tracker."""
 
 from homeassistant.components.device_tracker import SourceType
 from homeassistant.components.device_tracker.config_entry import ScannerEntity
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .const import DOMAIN
-from .entity import MyChevroletEntity
-from .helpers import get_location
-
-_LOGGER = logging.getLogger(__name__)
+from .coordinator import MyChevroletConfigEntry, Sample
+from .entity import TelemetryEntity
 
 
 async def async_setup_entry(
-    hass, entry, async_add_entities
-) -> None:  # type: ignore[no-untyped-def]
-    """Set up the vehicle location tracker."""
-    coordinator: DataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id][
-        "coordinator"
-    ]
-    vin = entry.data["vin"]
-    async_add_entities([MyChevroletTracker(coordinator, vin)])
+    hass: HomeAssistant,
+    entry: MyChevroletConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Expose GPS only for vehicles opted in to location collection."""
+    async_add_entities(
+        MyChevroletTracker(coordinator, "location")
+        for coordinator in entry.runtime_data.values()
+        if coordinator.location_enabled and "location" in coordinator.onstar.commands
+    )
 
 
-class MyChevroletTracker(MyChevroletEntity, ScannerEntity):
-    """Report the vehicle's last known GPS position."""
+class MyChevroletTracker(TelemetryEntity, ScannerEntity):
+    """Report a fresh location when available."""
 
-    _attr_name = "Location"
     _attr_source_type = SourceType.GPS
 
-    def __init__(self, coordinator, vin):  # type: ignore[no-untyped-def]
-        super().__init__(coordinator, "location", "Location")
-
     @property
-    def is_connected(self) -> bool:
-        """True when the vehicle has reported a GPS position."""
-        location = get_location(self.coordinator.data)
-        return bool(location and location.get("latitude") is not None)
+    def sample(self) -> Sample | None:
+        """Return the complete GPS sample."""
+        return self.coordinator.location
 
     @property
     def latitude(self) -> float | None:
-        """Return latitude."""
-        location = get_location(self.coordinator.data)
-        return location.get("latitude") if location else None
+        """Return the vehicle's latitude."""
+        return self.sample.value["latitude"] if self.sample else None
 
     @property
     def longitude(self) -> float | None:
-        """Return longitude."""
-        location = get_location(self.coordinator.data)
-        return location.get("longitude") if location else None
-
-    @property
-    def extra_state_attributes(self) -> dict[str, Any]:
-        """Pass through heading and speed when the vehicle reports them."""
-        location = get_location(self.coordinator.data)
-        if not location:
-            return {}
-        return {
-            key: location[key]
-            for key in ("heading", "speed", "altitude")
-            if key in location
-        }
+        """Return the vehicle's longitude."""
+        return self.sample.value["longitude"] if self.sample else None

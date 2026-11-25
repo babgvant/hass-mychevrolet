@@ -1,480 +1,334 @@
-"""Async OnStar client that uses the GM Auth API."""
+"""GM account discovery and vehicle telemetry client."""
+
 from __future__ import annotations
 
-import logging
+import asyncio
+import re
+import secrets
 import time
-from typing import Any, Dict, List, Optional, cast
+from collections.abc import Mapping
+from typing import Any
+from urllib.parse import urlsplit
 
-import httpx
 from .api import OnStarAPIClient
-from .auth import GMAuth, get_gm_api_jwt, DecodedPayload
+from .auth import GMAuth
 from .commands import CommandFactory
-from .types import (
-    AlertRequestOptions,
-    ChargeOverrideOptions,
-    DiagnosticsRequestOptions,
-    DoorRequestOptions,
-    SetChargingProfileRequestOptions,
-    TrunkRequestOptions,
-)
+from .http import EV_HOST, AuthError, CloudError, request_json
 
-__all__ = ["OnStar"]
+VEHICLES = "/account/vehicles?includeCommands=true&includeEntitlements=true&includeModules=true"
+GARAGE = "/mbff/garage/v1"
+EV_BASE = f"https://{EV_HOST}/api/gmone/v1"
+VIN_PATTERN = re.compile(r"[A-HJ-NPR-Z0-9]{17}")
 
-TOKEN_REFRESH_WINDOW_SECONDS = 5 * 60
-logger = logging.getLogger(__name__)
+
+def object_at(data: Any, *path: str) -> dict[str, Any]:
+    """Read a nested object defensively."""
+    for key in path:
+        data = data.get(key) if isinstance(data, dict) else None
+    return data if isinstance(data, dict) else {}
+
+
+class Account:
+    """Share discovery, scheduling and authentication across the account."""
+
+    def __init__(self, auth: GMAuth) -> None:
+        self.auth = auth
+        self.api = OnStarAPIClient(auth)
+        self.requests = asyncio.Semaphore(2)
+        self._vehicles: dict[str, dict[str, Any]] = {}
+        self._discovery_expires = 0.0
+        self._discovery_lock = asyncio.Lock()
+        self.endpoint_deadlines: dict[str, float] = {}
+
+    async def _discover(self) -> list:
+        try:
+            result = await self.api.api_request("GET", VEHICLES)
+        except CloudError as error:
+            if error.status not in (403, 404, 410):
+                raise
+        else:
+            vehicles = object_at(result, "vehicles").get("vehicle")
+            if isinstance(vehicles, list) and vehicles:
+                return vehicles
+        result = await self.api.api_request(
+            "POST",
+            GARAGE,
+            text_body="query getVehiclesMBFF { vehicles { vin make model nickName year onstarCapable vehicleType } }",
+        )
+        vehicles = object_at(result, "data").get("vehicles")
+        if result.get("errors") or not isinstance(vehicles, list):
+            raise CloudError
+        return [
+            {**vehicle, "garage_record": True}
+            for vehicle in vehicles
+            if isinstance(vehicle, dict)
+        ]
+
+    async def vehicle_details(self, vin: str) -> dict[str, Any]:
+        """Resolve a garage-only vehicle's advertised powertrain."""
+        if not VIN_PATTERN.fullmatch(vin):
+            raise CloudError
+        async with self.requests:
+            response = await self.api.api_request(
+                "POST",
+                GARAGE,
+                text_body=(
+                    'query getMbffGarageVehicleDetails { vehicleDetails(vin: "'
+                    + vin
+                    + '") { vin vehicleMetaData { propulsionAndFuelType { fuelCategory propulsionType } } } }'
+                ),
+            )
+        details = object_at(response, "data", "vehicleDetails")
+        returned_vin = details.get("vin")
+        if (
+            response.get("errors")
+            or not isinstance(returned_vin, str)
+            or returned_vin.upper() != vin
+        ):
+            raise CloudError
+        return object_at(details, "vehicleMetaData", "propulsionAndFuelType")
+
+    async def vehicles(self) -> dict[str, dict[str, Any]]:
+        """Discover the garage once per freshness window."""
+        async with self._discovery_lock:
+            now = time.monotonic()
+            if now < self._discovery_expires:
+                return self._vehicles
+            deadline = self.endpoint_deadlines.get("vehicles", 0)
+            if now < deadline:
+                raise CloudError(429, deadline - now)
+            try:
+                vehicles = await self._discover()
+            except CloudError as error:
+                self.endpoint_deadlines["vehicles"] = time.monotonic() + max(
+                    1800 if error.status == 429 else 60, error.retry_after
+                )
+                raise
+            self._vehicles = {
+                item["vin"].upper(): item
+                for item in vehicles
+                if isinstance(item, dict)
+                and isinstance(item.get("vin"), str)
+                and VIN_PATTERN.fullmatch(item["vin"].upper())
+            }
+            self._discovery_expires = time.monotonic() + 3600
+            return self._vehicles
+
+    def reuse_discovery(self, other: Account) -> None:
+        """Reuse the authorized garage response after linking."""
+        self._vehicles = other._vehicles
+        self._discovery_expires = other._discovery_expires
 
 
 class OnStar:
-    """Simple async OnStar client.
-
-    Parameters
-    ----------
-    username
-        GM / OnStar account email.
-    password
-        Account password.
-    device_id
-        UUID used by the official app (can be random UUID4).
-    vin
-        Vehicle VIN – will be upper-cased automatically.
-    onstar_pin
-        Numeral account PIN (currently *unused* but kept for future endpoints).
-    totp_secret
-        16-char secret used for MFA (Third-party authenticator).
-    token_location
-        Directory where ``microsoft_tokens.json`` / ``gm_tokens.json`` will be
-        cached (default: current working directory).
-    check_request_status
-        When *True* follows up on command requests until they complete (default: True).
-    request_polling_timeout_seconds
-        Maximum time in seconds to poll for command status (default: 90).
-    request_polling_interval_seconds
-        Time in seconds to wait between status polling requests (default: 6).
-    debug
-        When *True* emits verbose debug output from both *GMAuth* and the high-
-        level client.
-    http_client
-        Pre-configured httpx AsyncClient to use (if None, a new one will be created).
-        This is useful for integrations that need to handle SSL certificate loading in
-        a specific way, like Home Assistant.
-    """
+    """Access telemetry and explicitly permitted controls for one VIN."""
 
     def __init__(
         self,
-        *,
-        username: str,
-        password: str,
-        device_id: str,
+        account: Account,
         vin: str,
-        onstar_pin: str,
-        totp_secret: str,
-        token_location: str | None = None,
-        check_request_status: bool = True,
-        request_polling_timeout_seconds: int = 90,
-        request_polling_interval_seconds: int = 15,
-        debug: bool = False,
-        http_client: httpx.AsyncClient = None,
-    ) -> None:
-        """Initialize OnStar client."""
-        self._vin = vin.upper()
-        self._http_client = http_client
-        
-        self._auth = self._create_auth(
-            username=username,
-            password=password,
-            device_id=device_id,
-            totp_secret=totp_secret,
-            token_location=token_location or "./",
-            debug=debug,
-        )
-        
-        # Set up API client
-        self._api_client = OnStarAPIClient(
-            request_polling_timeout_seconds=request_polling_timeout_seconds,
-            request_polling_interval_seconds=request_polling_interval_seconds,
-            debug=debug,
-            http_client=http_client,
-        )
-        
-        # Command status tracking
-        self._check_request_status = check_request_status
-        
-        # Token information
-        self._token_resp: Optional[Dict[str, Any]] = None
-        self._decoded_payload: Optional[DecodedPayload] = None
-        
-        # Store available commands
-        self._available_commands: Dict[str, Dict[str, Any]] = {}
-        self._vehicle_data: Optional[Dict[str, Any]] = None
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _create_auth(
-        self,
+        vehicle: dict[str, Any],
         *,
-        username: str,
-        password: str,
-        device_id: str,
-        totp_secret: str,
-        token_location: str,
-        debug: bool,
-    ) -> GMAuth:
-        """Create and configure GMAuth instance."""
-        return GMAuth(
-            {
-                "username": username,
-                "password": password,
-                "device_id": device_id,
-                "totp_key": totp_secret,
-                "token_location": token_location,
-            },
-            debug=debug,
-            http_client=getattr(self, '_http_client', None),
+        controls: bool = False,
+    ) -> None:
+        self.account = account
+        self.vin = vin
+        self.vehicle = vehicle
+        self.controls = controls
+        self._ev_token = ""
+        self._ev_vehicle = ""
+        self._ev_until = 0.0
+        self._legacy_health_until = 0.0
+
+    @property
+    def commands(self) -> dict[str, dict[str, Any]]:
+        """Read vehicle-specific capabilities from its account record."""
+        commands = object_at(self.vehicle, "commands").get("command")
+        if not isinstance(commands, list):
+            return {}
+        return {
+            item["name"]: item
+            for item in commands
+            if isinstance(item, dict)
+            and isinstance(item.get("name"), str)
+            and isinstance(item.get("url"), str)
+        }
+
+    @property
+    def diagnostics_supported(self) -> list[str]:
+        """Return the vehicle-advertised diagnostic groups."""
+        items = object_at(
+            self.commands.get("diagnostics"), "commandData", "supportedDiagnostics"
+        ).get("supportedDiagnostic")
+        return (
+            [item for item in items if isinstance(item, str)]
+            if isinstance(items, list)
+            else []
         )
 
-    def _needs_token_refresh(self, token: Dict[str, Any] | None) -> bool:
-        """Check if the token needs to be refreshed."""
-        if not token:
-            return True
-        return token.get("expires_at", 0) < int(time.time()) + TOKEN_REFRESH_WINDOW_SECONDS
+    @property
+    def electric(self) -> bool:
+        """Find evidence of an EV powertrain or EV diagnostics."""
+        return any(
+            name.startswith(("EV ", "CHARGER ")) for name in self.diagnostics_supported
+        ) or any(
+            str(self.vehicle.get(key, "")).upper()
+            in {
+                "BEV",
+                "EV",
+                "BATTERY_ELECTRIC",
+                "ELECTRIC",
+                "PHEV",
+            }
+            for key in ("propulsionType", "fuelCategory", "vehicleType")
+        )
 
-    async def _ensure_token(self, force: bool = False) -> None:
-        """Ensure a valid token is available, refreshing if necessary.
-        
-        Parameters
-        ----------
-        force
-            When True, forces a token refresh even if the current token is still valid.
-        """
-        if force or self._needs_token_refresh(self._token_resp):
-            logger.debug("Retrieving new GM auth token…")
-            # Use the async get_gm_api_jwt function
-            res = await get_gm_api_jwt(
-                self._auth.config,  # Pass GMAuth's config directly
-                debug=self._auth.debug,  # Pass the debug flag from GMAuth instance
-                http_client=self._http_client,  # Pass the HTTP client
-                force_refresh=force  # Pass force parameter to ignore cached tokens
+    def command_available(self, name: str) -> bool:
+        """Require an enabled, supported and explicitly non-privileged action."""
+        command = self.commands.get(name)
+        return (
+            self.controls
+            and command is not None
+            and str(command.get("isPrivSessionRequired", "")).lower() == "false"
+        )
+
+    async def _command(
+        self,
+        name: str,
+        body: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        command = self.commands.get(name)
+        if command is None:
+            raise CloudError(404)
+        try:
+            path = urlsplit(command["url"]).path
+        except ValueError:
+            raise CloudError from None
+        if not path.endswith(f"/{self.vin}/commands/{name}"):
+            raise CloudError
+        return await self.account.api.api_request(
+            "POST", command["url"], json_body=body, poll=True
+        )
+
+    async def diagnostics(self) -> dict[str, Any]:
+        """Prefer cached vehicle health and use legacy diagnostics when needed."""
+        if time.monotonic() >= self._legacy_health_until:
+            try:
+                response = await self.account.api.api_request(
+                    "GET", f"/api/v1/vh/vehiclehealth/v1/healthstatus/{self.vin}"
+                )
+            except CloudError as error:
+                if error.status not in (403, 404, 410) or error.retry_after:
+                    raise
+            else:
+                if (
+                    isinstance(response.get("diagnostics"), list)
+                    and response["diagnostics"]
+                ):
+                    return response
+            if self.diagnostics_supported:
+                self._legacy_health_until = time.monotonic() + 21600
+        if not self.diagnostics_supported:
+            raise CloudError(404)
+        return await self._command(
+            "diagnostics", CommandFactory.diagnostics(self.diagnostics_supported)
+        )
+
+    async def location(self) -> dict[str, Any]:
+        """Fetch location through the vehicle's advertised telemetry command."""
+        return await self._command("location")
+
+    async def execute_command(self, name: str) -> dict[str, Any]:
+        """Restrict control actions even when the entity is already registered."""
+        if name not in {
+            "lockDoor",
+            "unlockDoor",
+            "start",
+            "cancelStart",
+            "alert",
+        } or not self.command_available(name):
+            raise CloudError(403)
+        self.vehicle = (await self.account.vehicles()).get(self.vin, {})
+        if not self.command_available(name):
+            raise CloudError(403)
+        bodies = {
+            "lockDoor": CommandFactory.lock_door,
+            "unlockDoor": CommandFactory.unlock_door,
+            "alert": CommandFactory.alert,
+        }
+        factory = bodies.get(name)
+        return await self._command(name, factory() if factory else None)
+
+    def _ev_params(self) -> dict[str, str]:
+        return {
+            "vehicleVin": self.vin,
+            "clientVersion": "8.20.0.8164",
+            "clientType": "bev-myowner",
+            "buildType": "r",
+            "clientLocale": "en-US",
+            "deviceId": self.account.auth.device_id,
+            "os": "a",
+            "ts": str(int(time.time() * 1000)),
+            "sid": secrets.token_hex(8).upper(),
+            "pid": secrets.token_hex(8).upper(),
+        }
+
+    async def _ev_request(self, mobile_token: str) -> dict[str, Any]:
+        session = self.account.auth.session
+        if time.monotonic() >= self._ev_until:
+            result = await request_json(
+                session,
+                "POST",
+                f"{EV_BASE}/admin/initSession",
+                EV_HOST,
+                params=self._ev_params(),
+                data={"token": mobile_token, "vehicleVIN": self.vin},
             )
-            self._token_resp = cast(Dict[str, Any], res["token"])
-            self._decoded_payload = cast(DecodedPayload, res["decoded_payload"])
-
-    def _get_command_url(self, command_name: str) -> str:
-        """Get the URL for a specific command from the available commands."""
-        if command_name in self._available_commands:
-            return self._available_commands[command_name]["url"]
-        
-        # Fallback to hardcoded paths if command not found
-        logger.warning(f"Command '{command_name}' not found in available commands, using fallback URL")
-        return f"/account/vehicles/{self._vin}/commands/{command_name}"
-
-    async def _api_request(
-        self, 
-        method: str,
-        path: str, 
-        *, 
-        json_body: Any | None = None,
-        check_request_status: bool | None = None,
-        max_polls: int | None = None,
-        force_token_refresh: bool = False
-    ) -> Dict[str, Any]:
-        """Make an authenticated request to the OnStar API."""
-        await self._ensure_token(force=force_token_refresh)
-        
-        should_check_status = check_request_status if check_request_status is not None else self._check_request_status
-        
-        return await self._api_client.api_request(
-            self._token_resp["access_token"],
-            method,
-            path,
-            json_body=json_body,
-            check_request_status=should_check_status,
-            max_polls=max_polls
+            results = result.get("results")
+            item = results[0] if isinstance(results, list) and results else None
+            token = object_at(item, "loginResponse").get("token")
+            vehicle = object_at(item, "getVehicleChargingMetricsResponse").get(
+                "vehicleId"
+            )
+            if (
+                not token
+                or not isinstance(token, str)
+                or not vehicle
+                or not isinstance(vehicle, str)
+            ):
+                raise CloudError
+            self._ev_token, self._ev_vehicle = token, vehicle
+            self._ev_until = time.monotonic() + 1800
+        data = await request_json(
+            session,
+            "GET",
+            f"{EV_BASE}/vehicle/getVehicleChargingMetrics",
+            EV_HOST,
+            params={
+                **self._ev_params(),
+                "vehicleId": self._ev_vehicle,
+                "varch": "globalb",
+            },
+            headers={"x-gm-mobiletoken": mobile_token, "x-gm-token": self._ev_token},
         )
+        results = data.get("results")
+        if not isinstance(results, list):
+            raise CloudError
+        for item in results:
+            if isinstance(item, dict) and item.get("vehicleId") == self._ev_vehicle:
+                return item
+        raise CloudError
 
-    # ------------------------------------------------------------------
-    # Public API methods
-    # ------------------------------------------------------------------
-
-    async def get_account_vehicles(self) -> Dict[str, Any]:
-        """Get all vehicles associated with the account."""
-        response = await self._api_request(
-            "GET", 
-            "/account/vehicles?includeCommands=true&includeEntitlements=true&includeModules=true"
-        )
-        
-        # Parse and store available commands for the current VIN
-        if response and "vehicles" in response and "vehicle" in response["vehicles"]:
-            for vehicle in response["vehicles"]["vehicle"]:
-                if vehicle.get("vin") == self._vin and "commands" in vehicle and "command" in vehicle["commands"]:
-                    # Store the full vehicle data
-                    self._vehicle_data = vehicle
-                    
-                    # Process commands
-                    commands = {}
-                    for cmd in vehicle["commands"]["command"]:
-                        if "name" in cmd and "url" in cmd:
-                            commands[cmd["name"]] = cmd
-                    
-                    self._available_commands = commands
-                    logger.debug(f"Stored {len(commands)} available commands for VIN {self._vin}")
-        
-        return response
-
-    def is_command_available(self, command_name: str) -> bool:
-        """Check if a specific command is available for the vehicle."""
-        return command_name in self._available_commands
-    
-    def get_command_data(self, command_name: str) -> Dict[str, Any]:
-        """Get additional data for a specific command."""
-        if command_name in self._available_commands:
-            return self._available_commands[command_name]
-        return {}
-        
-    def requires_privileged_session(self, command_name: str) -> bool:
-        """Check if a command requires a privileged session."""
-        if command_name in self._available_commands:
-            return self._available_commands[command_name].get("isPrivSessionRequired", "false") == "true"
-        return False
-
-    async def execute_command(self, command_name: str, request_body: Dict[str, Any] = None) -> Dict[str, Any]:
-        """Execute any available command discovered from the API.
-        
-        This generic method allows executing any command available for the vehicle,
-        even if not explicitly implemented as a method in this client.
-        
-        Parameters
-        ----------
-        command_name
-            The name of the command to execute (must be in the available commands)
-        request_body
-            Optional JSON body to send with the request
-            
-        Returns
-        -------
-        Dict[str, Any]
-            The command response
-            
-        Raises
-        ------
-        ValueError
-            If the command is not available for this vehicle
-        """
-        if not self.is_command_available(command_name):
-            logger.error(f"Command '{command_name}' not available for this vehicle")
-            raise ValueError(f"Command '{command_name}' not available for this vehicle")
-        
-        return await self._api_request(
-            "POST",
-            self._get_command_url(command_name),
-            json_body=request_body
-        )
-
-    # ------------------------------------------------------------------
-    # Vehicle Commands
-    # ------------------------------------------------------------------
-
-    async def start(self) -> Dict[str, Any]:
-        """Start the vehicle."""
-        return await self.execute_command("start")
-
-    async def cancel_start(self) -> Dict[str, Any]:
-        """Cancel the start command."""
-        return await self.execute_command("cancelStart")
-
-    async def lock_door(self, options: Optional[DoorRequestOptions] = None) -> Dict[str, Any]:
-        """Lock the vehicle doors."""
-        return await self.execute_command("lockDoor", CommandFactory.lock_door(options))
-
-    async def unlock_door(self, options: Optional[DoorRequestOptions] = None) -> Dict[str, Any]:
-        """Unlock the vehicle doors."""
-        return await self.execute_command("unlockDoor", CommandFactory.unlock_door(options))
-
-    async def lock_trunk(self, options: Optional[TrunkRequestOptions] = None) -> Dict[str, Any]:
-        """Lock the vehicle trunk."""
-        return await self.execute_command("lockTrunk", CommandFactory.lock_trunk(options))
-
-    async def unlock_trunk(self, options: Optional[TrunkRequestOptions] = None) -> Dict[str, Any]:
-        """Unlock the vehicle trunk."""
-        return await self.execute_command("unlockTrunk", CommandFactory.unlock_trunk(options))
-
-    async def alert(self, options: Optional[AlertRequestOptions] = None) -> Dict[str, Any]:
-        """Trigger the vehicle alert (honk/flash)."""
-        return await self.execute_command("alert", CommandFactory.alert(options))
-
-    async def cancel_alert(self) -> Dict[str, Any]:
-        """Cancel the alert command."""
-        return await self.execute_command("cancelAlert")
-
-    async def charge_override(self, options: Optional[ChargeOverrideOptions] = None) -> Dict[str, Any]:
-        """Override vehicle charging settings."""
-        return await self.execute_command("chargeOverride", CommandFactory.charge_override(options))
-
-    async def get_charging_profile(self) -> Dict[str, Any]:
-        """Get the vehicle charging profile."""
-        return await self.execute_command("getChargingProfile")
-
-    async def set_charging_profile(self, options: Optional[SetChargingProfileRequestOptions] = None) -> Dict[str, Any]:
-        """Set the vehicle charging profile."""
-        return await self.execute_command(
-            "setChargingProfile", 
-            CommandFactory.set_charging_profile(options)
-        )
-
-    async def get_charger_power_level(self) -> Dict[str, Any]:
-        """Get the vehicle's charger power level."""
-        return await self.execute_command("getChargerPowerLevel")
-        
-    def get_supported_diagnostics(self) -> List[str]:
-        """Get the list of diagnostic items supported by the vehicle."""
-        supported_diagnostics = []
-        command_data = self.get_command_data("diagnostics")
-        
-        if (command_data and "commandData" in command_data and 
-                "supportedDiagnostics" in command_data["commandData"] and 
-                "supportedDiagnostic" in command_data["commandData"]["supportedDiagnostics"]):
-            supported_diagnostics = command_data["commandData"]["supportedDiagnostics"]["supportedDiagnostic"]
-            
-        return supported_diagnostics
-
-    async def diagnostics(
-        self, 
-        options: Optional[DiagnosticsRequestOptions] = None, 
-        max_polls: Optional[int] = None
-    ) -> Dict[str, Any]:
-        """Get diagnostic data from the vehicle."""
-        if not self.is_command_available("diagnostics"):
-            logger.error("Diagnostics command not available for this vehicle")
-            raise ValueError("Diagnostics command not available for this vehicle")
-            
-        # Get supported diagnostics
-        supported_diagnostics = self.get_supported_diagnostics()
-        
-        if not supported_diagnostics:
-            logger.warning("No supported diagnostics found for this vehicle")
-            
-        # Process requested diagnostic items
-        requested_items = None
-        if options and "diagnostic_item" in options:
-            requested_items = options["diagnostic_item"]
-            
-            # Validate that requested items are supported
-            unsupported = [item for item in requested_items if item not in supported_diagnostics]
-            if unsupported:
-                logger.warning(f"Requested unsupported diagnostic items: {unsupported}")
-                logger.warning(f"Supported items: {supported_diagnostics}")
-                
-            # Filter to only include supported items
-            requested_items = [item for item in requested_items if item in supported_diagnostics]
-            
-            if not requested_items:
-                logger.error("None of the requested diagnostic items are supported")
-                raise ValueError("None of the requested diagnostic items are supported")
-        
-        # Build request body with CommandFactory
-        diagnostic_items = requested_items if requested_items else supported_diagnostics
-        body = CommandFactory.diagnostics(diagnostic_items)
-        
-        # Use extended timeout for diagnostics
-        return await self._api_request(
-            "POST",
-            self._get_command_url("diagnostics"),
-            json_body=body,
-            check_request_status=True,
-            max_polls=max_polls
-        )
-        
-    async def location(self) -> Dict[str, Any]:
-        """Get the vehicle's current location."""
-        return await self.execute_command("location")
-
-    def get_vehicle_data(self) -> Dict[str, Any]:
-        """Get the full vehicle data that was retrieved during get_account_vehicles."""
-        if not self._vehicle_data:
-            logger.warning("Vehicle data not available. Call get_account_vehicles() first.")
-            return {}
-        return self._vehicle_data
-    
-    def get_entitlements(self) -> List[Dict[str, Any]]:
-        """Get the list of entitlements for the vehicle."""
-        if not self._vehicle_data or "entitlements" not in self._vehicle_data:
-            logger.warning("Entitlements not available. Call get_account_vehicles() first.")
-            return []
-        
-        if "entitlement" in self._vehicle_data["entitlements"]:
-            return self._vehicle_data["entitlements"]["entitlement"]
-        return []
-    
-    def is_entitled(self, entitlement_id: str) -> bool:
-        """Check if the vehicle is entitled to a specific feature."""
-        entitlements = self.get_entitlements()
-        for entitlement in entitlements:
-            if entitlement.get("id") == entitlement_id and entitlement.get("eligible") == "true":
-                return True
-        return False
-
-    def get_supported_hvac_settings(self) -> Dict[str, Any]:
-        """Get the supported HVAC settings for the vehicle."""
-        if not self._available_commands or "setHvacSettings" not in self._available_commands:
-            logger.warning("HVAC settings command not available. Call get_account_vehicles() first.")
-            return {}
-        
-        hvac_command = self._available_commands["setHvacSettings"]
-        if "commandData" in hvac_command and "supportedHvacData" in hvac_command["commandData"]:
-            return hvac_command["commandData"]["supportedHvacData"]
-        return {}
-        
-    async def set_hvac_settings(self, ac_mode: Optional[str] = None, heated_steering_wheel: Optional[bool] = None) -> Dict[str, Any]:
-        """Set HVAC settings for the vehicle."""
-        if not self.is_command_available("setHvacSettings"):
-            logger.error("setHvacSettings command not available for this vehicle")
-            raise ValueError("setHvacSettings command not available for this vehicle")
-        
-        # Get supported settings to validate inputs
-        supported_settings = self.get_supported_hvac_settings()
-        
-        # Validate AC climate mode if provided
-        if ac_mode is not None:
-            supported_modes = []
-            if "supportedAcClimateModeSettings" in supported_settings:
-                supported_modes = supported_settings["supportedAcClimateModeSettings"].get("supportedAcClimateModeSetting", [])
-            
-            if supported_modes and ac_mode not in supported_modes:
-                supported_str = ", ".join(supported_modes) if supported_modes else "none"
-                logger.warning(f"Unsupported AC climate mode: {ac_mode}. Supported modes: {supported_str}")
-        
-        # Validate heated steering wheel if provided
-        if heated_steering_wheel is not None:
-            is_supported = supported_settings.get("heatedSteeringWheelSupported", "false") == "true"
-            if not is_supported:
-                logger.warning("Heated steering wheel not supported by this vehicle")
-        
-        # Create command payload and execute
-        return await self.execute_command(
-            "setHvacSettings", 
-            CommandFactory.set_hvac_settings(ac_mode, heated_steering_wheel)
-        )
-
-    async def close(self):
-        """Close the API client and release resources."""
-        await self._api_client.close()
-
-    # ------------------------------------------------------------------
-    # Authentication methods
-    # ------------------------------------------------------------------
-
-    async def force_token_refresh(self) -> bool:
-        """Force a refresh of the access token regardless of expiration status.
-        
-        This can be useful when working with failed API requests or when you suspect
-        the token might have been invalidated on the server side.
-        
-        Returns
-        -------
-        bool
-            True if token was successfully refreshed, False otherwise
-        """
-        logger.debug("Forcing token refresh...")
-        await self._ensure_token(force=True)
-        return True
+    async def ev_metrics(self) -> dict[str, Any]:
+        """Read cached EV metrics without invoking the forced vehicle refresh."""
+        token = await self.account.auth.access_token()
+        try:
+            return await self._ev_request(token)
+        except CloudError as error:
+            if error.status != 401:
+                raise
+            self._ev_until = 0
+            return await self._ev_request(token)
+        except AuthError:
+            self._ev_until = 0
+            raise
