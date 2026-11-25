@@ -1,287 +1,67 @@
 # myChevrolet for Home Assistant
 
-A Home Assistant integration for **Chevrolet / GMC / Buick / Cadillac plug-in and
-electric vehicles** that are enrolled in the **myChevrolet / myGMC / myBuick /
-myCadillac** app (US region, OnStar-backed). It exposes battery, charge, range,
-odometer, tire-pressure and GPS data as sensors, and door-lock / remote-start /
-honk-and-flash as controls — all by polling the same OnStar cloud API the mobile
-app uses.
+[![Add myChevrolet to HACS](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=babgvant&repository=hass-mychevrolet&category=integration)
 
-Built on top of [`onyonstar`](./custom_components/mychevrolet/onyonstar/) (a
-vendored fork of [`pyonstar`](https://github.com/leboff/pyonstar)), a pure-Python
-port of the OnStarJS client. `onyonstar` is included directly in this repository
-so there is no external PyPI dependency that can go unmaintained. It handles the
-Microsoft B2C login, the GM API token exchange, two-token caching, JWT signature
-verification via JWKS, and command-status polling.
+myChevrolet connects Home Assistant directly to GM's unofficial OnStar APIs. It focuses on vehicle telemetry for energy-management automations, including EV state of charge, charge target and plug state. It runs inside Home Assistant using Python. The integration targets US accounts on GM's North American backend. Coverage varies by model, subscription and API response. The 2026 Silverado EV Trail Boss Max Range still needs live validation.
 
-> **Region:** This integration targets the **US** OnStar cloud
-> (`na-mobile-api.gm.com`). Vehicles enrolled on a different regional backend
-> (LATAM, Europe, etc.) use a different API and are **not** supported.
+## Install and update with HACS
 
----
+Use Home Assistant **2026.11.0 or later** and, for development, **Python 3.14.2 or later**. In HACS, open **Custom repositories** from the menu, add `https://github.com/babgvant/hass-mychevrolet` as an **Integration**, download **myChevrolet**, and restart Home Assistant. In **Settings → Devices & services**, add **myChevrolet**. HACS can use the default branch or published tagged releases. Use HACS **Redownload** to select another published release, then restart. The application automatically resolves the integration's Python dependencies.
 
-## Table of contents
+The release workflow builds a manual install ZIP and opens a draft for review. HACS installs the tree under `custom_components/mychevrolet` from the selected Git ref, including the vendored client. The HACS catalog is optional for a custom repository. [HACS integration publishing requirements](https://www.hacs.xyz/docs/publish/integration/)
 
-- [Features](#features)
-- [Supported vehicles](#supported-vehicles)
-- [Entities](#entities)
-- [Requirements](#requirements)
-- [Installation](#installation)
-  - [Home Assistant install button](#home-assistant-install-button)
-  - [Manual install](#manual-install)
-- [Configuration](#configuration)
-  - [Setup fields](#setup-fields)
-  - [Options](#options)
-- [Services](#services)
-- [How it works](#how-it-works)
-  - [Polling model](#polling-model)
-  - [Rate limiting and "cheater mode"](#rate-limiting-and-cheater-mode)
-  - [Re-authentication](#re-authentication)
-  - [Manual token fallback](#manual-token-fallback)
-- [Development](#development)
-- [Known limitations](#known-limitations)
-- [Credits & references](#credits--references)
-- [Disclaimer](#disclaimer)
+## Sign in to GM
 
----
+1. In the setup flow, choose **Sign in with GM in your browser**. On a desktop browser, open Developer Tools, select **Network**, and enable **Preserve log** or **Persist Logs**.
+2. Open the GM sign-in link while the Network panel is recording. Enter your username, password and any MFA response on GM's site.
+3. After GM redirects to its mobile app, inspect the final redirect response from `custlogin.gm.com`. Copy its **Location** header starting with `msauth.com.gm.mychevrolet://auth?` into the setup form. Keep the whole URL, including both state and code. The in-progress authorization expires after ten minutes. Close the Network panel when finished and avoid saving a HAR.
+4. Select the vehicles to add.
 
-## Features
+GM rejected the standard Home Assistant callback with `AADB2C90006` and serves its sign-in page for the registered mobile callback. PKCE binds the manually handed-off redirect to your setup flow. If your browser cannot expose the mobile redirect, choose **Import GM identity tokens** and paste the refresh token or the contents of a locally obtained `microsoft_tokens.json` issued to the same GM client. Home Assistant submits the refresh token directly to GM and validates the fresh Microsoft response. The reference Firefox tool can obtain a local token set. Review browser tools before using them and clear their redirect logs and downloaded token files afterward. [Reference Firefox tool](https://github.com/metheos/onstar_firefox)
 
-- **Cloud-poll, no local hacks.** Talks to the OnStar cloud exactly like the
-  official app. No root, no OBD dongle, no vehicle modification.
-- **Config-flow setup.** Credentials are entered through the UI and stored by
-  Home Assistant; nothing is hand-written except the optional token fallback.
-- **Automatic device & entity registry.** One device per VIN, entities tagged
-  with manufacturer/model so they group cleanly in your dashboard.
-- **EV-aware.** Electric / plug-in-hybrid vehicles automatically get the extra
-  battery, charge-state, plug, charger-power and EV-range sensors; a gasoline
-  vehicle simply doesn't expose them.
-- **Remote controls.** Lock/unlock doors, remote start/stop, honk & flash, plus a
-  one-tap "update data" button — each gated on whether your vehicle's plan
-  actually entitles that command.
-- **Reauth on expiry.** When GM rotates or revokes tokens and login stops
-  working, you get a re-auth prompt instead of a silent break.
-- **Integration health.** A `sensor.<vehicle>_health` entity reports `ok`,
-  `rate_limited`, or `error`, plus backoff timers and last successful update —
-  so you know at a glance when data is stale.
+Home Assistant prompts for reauthentication when GM revokes or stops refreshing the session. Open the notification in **Repairs**, then sign in to the same account and keep the original entry. Refresh lifetime and policy are controlled by GM. A fixed lifetime has not been verified.
 
-## Supported vehicles
+## Read-only and optional controls
 
-Any US-region vehicle that:
+Read-only is the default, requires no OnStar PIN, and adds no remote control entities. The update button and `mychevrolet.refresh_data` only request telemetry. Location is off by default. Enable it under **Configure** to add a GPS tracker for vehicles with the location endpoint. The optional controls setting enables only supported actions advertised as non-privileged. PIN-gated or ambiguous entitlements stay disabled. Door state is unknown unless independently available. These Home Assistant settings do not narrow the scopes of GM's tokens.
 
-1. Appears in the **myChevrolet** (or myGMC / myBuick / myCadillac) app, and
-2. Is enrolled in **OnStar** with data/remote services active.
+## Telemetry and power semantics
 
-This covers, for example, the **Bolt EV/EUV**, **Blazer EV**, **Equinox EV**,
-**Silverado EV**, **Cadillac Lyriq**, **GMC Hummer EV**, and OnStar-linked
-gasoline models. If the app can remote-start or lock your car, this integration
-can too.
+| Reported when supported | Meaning |
+| --- | --- |
+| Battery level, target charge level, electric range, reported battery energy | State of charge and charge limit in percent, range in km, and GM's reported `kwh` value. Its interpretation as usable pack capacity is unverified. |
+| Plug state, charge state, plug voltage, charger power level | Vehicle-reported status, GM diagnostic voltage and an unscaled charger category such as `level_2`. |
+| Charge completion, time remaining and charge mode | GM's completion estimate. Time remaining is calculated from that timestamp. |
+| Charge location and discharge settings | Reported location flags and discharge settings where GM returns these fields. |
+| Odometer, tire pressures and trip economy | Exposed from the covered telemetry endpoints. Trip consumption rate is in kWh/100 km. |
+| GPS, last successful telemetry read, telemetry age, health | Optional location, receipt time, newest observed sample age and endpoint health. |
 
-## Entities
+A cached EV response may be older than the current poll. Each sample-based entity includes `sample_at` and `timestamp_source`. The latter is `vehicle` when GM supplies a sample timestamp or `onstar_response` when only receipt time is available. A recent receipt does not prove recent vehicle activity. Missing fields retain their prior sample and original timestamp. Aged samples become unavailable after the greater of 60 minutes and two configured intervals, as evaluated on coordinator updates. Health can show `reauth_required`, `rate_limited`, `degraded`, `stale` or `ok`. The age sensor refers to the newest sample across available telemetry. Automations using SOC or plug status should check that entity's availability and `sample_at` before acting. Use Emporia for measured EVSE electrical consumption. The integration has no verified mapping for measured charging power, charging current, or total last-trip energy.
 
-Every entity hangs off a single device named after your vehicle (one per VIN).
+Home Assistant polls every 30 minutes by default. Configure 15–1440 minutes to suit the vehicle and subscription. Repeated refresh requests coalesce and respect the 15-minute minimum and endpoint backoff. Temporary failures and sleeping or unreachable vehicles increase the delay. GM's `Retry-After` is honored when supplied. The integration prefers cached vehicle health and EV metrics. Legacy diagnostics and optional location can contact the vehicle. Charging status is sampled and can lag.
 
-| Platform | Entity | Only on | Description |
-|---|---|---|---|
-| Sensor | Odometer | all | Total distance (km, total-increasing). |
-| Sensor | Battery Level | EV | State of charge (%). |
-| Sensor | Health | all | Integration health: `ok`, `rate_limited`, or `error`. |
-| Sensor | Charge State | EV | `charging` / `not_charging` / `fully_charged`. |
-| Sensor | Plug State | EV | `plugged` / `unplugged`. |
-| Sensor | Plug Voltage | EV | Available charge voltage (V). |
-| Sensor | Charger Power Level | EV | Charge rate tier (e.g. `level_2`). |
-| Sensor | EV Range | EV | Estimated driving range (km). |
-| Sensor | Last Trip Efficiency | all | Most recent trip economy. |
-| Sensor | Tire Pressure LF / RF / LR / RR | all | Per-wheel pressure (kPa) + status text. |
-| Binary sensor | Plugged In | EV | On when the vehicle reports plugged in. |
-| Device tracker | Location | all | Last GPS position (lat/long/heading/speed/altitude). |
-| Lock | Door Lock | all | Lock / unlock the doors. |
-| Button | Update Data | all | Force an immediate data refresh. |
-| Button | Honk & Flash | all* | Honk and flash the lights. |
-| Button | Remote Start | all* | Start the engine / drive unit. |
-| Button | Remote Stop | all* | Cancel a running remote start. |
+## Migrate, roll back and troubleshoot
 
-\* *Command buttons only appear if your vehicle's OnStar entitlements include
-that command.*
+1. Back up the Home Assistant configuration, including its registries, before replacing the upstream files.
+2. Install this fork over the same `custom_components/mychevrolet` directory and restart. Keep the integration entry. The migration preserves its VIN-based entity unique IDs and device identifiers, removes older authentication fields and requests reauthentication. New configurations support selecting multiple VINs per account. Migrated VIN entries remain individual entries and share a session once linked to the same GM identity.
+3. If you need to roll back to an upstream pre-migration build, restore the pre-migration Home Assistant backup and its matching integration files. Downgrading just the code cannot restore credentials or reverse the config-entry migration.
 
-## Requirements
+For `reauth_required`, complete GM sign-in again. For `rate_limited`, allow the cooldown to expire. For unavailable telemetry, check the entity's sample time and the integration's endpoint health. A 403 on an individual telemetry endpoint can mean the vehicle or subscription does not grant access. Download integration diagnostics for a report containing endpoint status and sample counts. Screenshots of your devices, raw network captures, debug logs from your browser, and Home Assistant backups can contain private data.
 
-- A **Home Assistant** instance (2023.x or newer recommended).
-- A **myChevrolet / OnStar** account (US region) with remote services active.
-- The vehicle's **VIN** (17 characters).
-- Optional but often required: a **TOTP secret**. GM's login increasingly gates
-  automated clients behind a time-based one-time password shown in the app's
-  security setup. Leave blank if your account doesn't use it.
-- Python dependencies (`pyjwt`, `pyotp`, `aiofiles`) are pinned in
-  `manifest.json` and installed automatically by Home Assistant. `httpx` is
-  provided by Home Assistant core.
+## Security and development
 
-## Installation
+Account-scoped refresh tokens are written atomically with private permissions where supported. TLS certificate verification remains enabled. The integration verifies Microsoft identity tokens against GM's published signing keys, issuer and client audience. GM's exchanged service bearer is used with GM APIs over TLS. The integration derives account identity from the verified Microsoft claims. Config entries contain vehicle selections and an account identifier. Home Assistant backups can contain reusable refresh tokens, and local token storage is plaintext. Secure access to the Home Assistant configuration and backups. Removing the last entry for an account removes its token file. Browser sign-in and MFA remain GM's responsibility.
 
-### Manual install (required first)
+Use a Linux development environment with Python 3.14 and run:
 
-1. Copy the `mychevrolet` folder into your Home Assistant
-   `config/custom_components/` directory.
-2. Restart Home Assistant.
-3. Go to **Settings → Devices & Services → Add Integration** and search for
-   **myChevrolet**.
-
-### Home Assistant install button (after manual install)
-
-Once the files are in place, click the badge at the top of this page to start
-the config flow directly:
-
-[![Install myChevrolet in Home Assistant](https://my.home-assistant.io/badges/config_flow_start.svg)](https://my.home-assistant.io/redirect/config_flow_start/?domain=mychevrolet)
-
-### HACS (card only)
-
-The **integration** is manual install only — it is not in the official Home
-Assistant marketplace or HACS default store. Add `mychevrolet` manually as above.
-
-The **card** (`hass-mychevrolet-card`) can be installed via HACS: add
-`https://github.com/Dvalin21/hass-mychevrolet-card` as a custom repository
-(category: **Frontend**), install **myChevrolet Status Card**, then force-refresh
-your browser (`Ctrl+F5`).
-
-Or manually: download `mychevrolet-status-card.js` from the latest release,
-place it in `config/www/`, add a resource at `/local/mychevrolet-status-card.js`
-(type: `module`), and force-refresh.
-
-## Configuration
-
-Setup is a config-flow form. Enter the account credentials and the target VIN;
-the flow validates them against the OnStar cloud before creating the entry.
-
-### Setup fields
-
-| Field | Required | Notes |
-|---|---|---|
-| Account email | ✔ | Your myChevrolet login email. |
-| Password | ✔ | Your myChevrolet password. |
-| Vehicle VIN | ✔ | 17-char VIN of the car to add. One integration entry per VIN. |
-| TOTP secret | – | Secret from GM's authenticator setup. Required if your account enforces 2FA for automated logins. |
-| Device ID | – | Optional UUID identifying this client. Auto-generated if left blank. |
-| Account PIN | – | Optional OnStar account PIN. |
-
-### Options
-
-After setup, open the integration's **Configure** dialog:
-
-| Option | Default | Notes |
-|---|---|---|
-| Poll interval (minutes) | `30` | How often to refresh diagnostics + location. Minimum 5. |
-| Cheater mode | `off` | See [below](#rate-limiting-and-cheater-mode). |
-
-> **Why 30 minutes?** `diagnostics` is the slow, rate-limited call (GM's cloud
-> can take up to ~180 s to answer and then throttles aggressive clients). Tight
-> polling mostly buys you `500`/`429` errors, not fresher data.
-
-## Services
-
-| Service | Description |
-|---|---|
-| `mychevrolet.refresh_data` | Force an immediate diagnostics + location refresh on every configured vehicle. Useful right after issuing a command. |
-
-## How it works
-
-### Polling model
-
-Each refresh cycle the coordinator:
-
-1. Enumerates the account's vehicles (to read the command/entitlement list), then
-2. Requests **location** and **diagnostics** in parallel.
-
-Diagnostics is the rich payload — odometer, battery, charge/plug state, range,
-tire pressure, trip economy — parsed in one place (`helpers.py`) so every entity
-reads the same response paths.
-
-### Rate limiting and "cheater mode"
-
-GM's OnStar link is slow and aggressively rate-limited. Two strategies are built
-in:
-
-- **Standard mode (default):** on a `429`, the coordinator backs off that
-  endpoint for **30 minutes** rather than hammering it. Only the endpoint that
-  returned `429` is backed off — the other keeps polling.
-- **Cheater mode (opt-in):** poll faster (2 min) and, on a `429`, recreate the
-  client with a fresh device ID to escape GM's per-device-id rate bucket. The
-  new device ID is persisted to your config entry, so it survives an HA
-  restart. Enable this only if you hit throttling and understand it trades a
-  bit more API traffic for fresher data.
-
-### Re-authentication
-
-`onyonstar` caches a Microsoft identity token and a GM API token under
-`.storage/mychevrolet/` with `0o600` file permissions. JWTs are verified against
-GM's JWKS for signature and issuer before being accepted. When GM expires or
-revokes them and a call comes back `401`/`403`, the config entry triggers a
-**re-auth** prompt — re-enter your credentials and everything resumes without
-re-adding the vehicle.
-
-### Manual token fallback
-
-If GM's bot detection blocks the automated web login (you see `Access Denied`
-during setup), you can drop in a token you captured by hand:
-
-1. Log in through the normal flow until it fails.
-2. Capture the `microsoft_tokens.json` the client wrote (or a token from a
-   working session).
-3. Place it at `.storage/mychevrolet/microsoft_tokens.json` in your HA config.
-
-On the next start the client uses the file directly instead of re-running the
-login. Token files are written with `0o600` permissions.
-
-## Development
-
-The integration is tested with the Home Assistant test harness
-(`pytest-homeassistant-custom-component`), with all OnStar network I/O mocked —
-no credentials or live vehicle required. `onyonstar` has its own unit tests for
-JWT verification, JWKS caching, and token file permissions.
-
-```bash
-python -m venv .venv && . .venv/bin/activate
-pip install "pytest-homeassistant-custom-component==0.13.200" \
-  "pyjwt>=2.8.0,<3.0.0" "pyotp>=2.9.0,<3.0.0" "aiofiles>=23.2.1,<24.0.0"
-ruff check custom_components/mychevrolet tests
-pytest
+```sh
+python -m venv .venv
+. .venv/bin/activate
+pip install pytest-homeassistant==2026.11.3 ruff
+ruff check .
+ruff format --check .
+python -m pytest
+python scripts/package_release.py 0.2.0
 ```
 
-17 tests pass: 8 integration tests (config flow, entity setup, unload, lock
-commands, gas vs EV, rate-limit backoff, health sensor, auth failure) and 9
-`onyonstar` unit tests (JWKS caching, JWT signature/issuer verification, bad
-signature rejection, token file permissions).
-
-## Known limitations
-
-- **US region only.** Other OnStar backends are unsupported.
-- **Polling, not push.** State reflects the last successful poll; there is no
-  real-time event stream.
-- **No live lock state.** The OnStar diagnostics payload doesn't report a live
-  door-lock status, so the lock entity shows an unknown state until a refresh
-  confirms it.
-- **Login can be fragile.** GM periodically tightens automated-login defenses;
-  when that happens, use the manual token fallback above until `onyonstar` is
-  updated.
-- **Token security.** Auth and GM API tokens are stored as JSON files under
-  `.storage/mychevrolet/` with `0o600` permissions. JWTs are verified against
-  GM's JWKS for signature and issuer. Protect your HA config directory — anyone
-  who can read these token files can unlock and start your vehicle.
-
-## Credits & references
-
-- [`onyonstar`](./custom_components/mychevrolet/onyonstar/) — vendored OnStar
-  client, originally [`pyonstar`](https://github.com/leboff/pyonstar) by Bryan
-  Leboff, itself a port of [`OnStarJS`](https://github.com/BigThunderSR/OnStarJS).
-  Vendored here to eliminate dependency on an unmaintained PyPI package.
-- Home Assistant [custom integration
-  docs](https://developers.home-assistant.io/docs/creating_component_file_structure)
-  and [config-flow
-  guide](https://developers.home-assistant.io/docs/creating_custom_config_entries).
-
-## Disclaimer
-
-This is an **unofficial** project for personal use. It is not affiliated with,
-endorsed by, or supported by General Motors, OnStar, or Home Assistant. It talks
-to a third-party cloud API in a way that may change or be restricted at any time.
-Use it at your own risk; the author is not responsible for vehicle damage,
-lockouts, or service interruptions.
+Use sanitized fixtures and mock GM network requests. See the [modernization audit and checklist](docs/modernization.md) and [changelog](CHANGELOG.md). The vendored client derives from Bryan Leboff's pyOnStar and the OnStarJS project by Ruben Medina and contributors. The upstream integration was created by Dvalin21. Included OnStarJS license notices are under `custom_components/mychevrolet/onyonstar`. Public release preparation remains subject to resolving the upstream integration's missing license grant. [Original integration](https://github.com/Dvalin21/hass-mychevrolet) · [pyOnStar](https://github.com/leboff/pyonstar) · [OnStarJS](https://github.com/BigThunderSR/OnStarJS)
