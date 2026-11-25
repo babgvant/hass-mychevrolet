@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Mapping
 from typing import Any
 from uuid import uuid4
@@ -26,6 +27,7 @@ from .const import (
     MIN_SCAN_INTERVAL,
 )
 from .onyonstar.auth import BrowserAttempt, GMAuth
+from .onyonstar.auth.native import NativeLogin, NativeUnavailable
 from .onyonstar.client import Account
 from .onyonstar.http import AuthError, CloudError
 
@@ -42,13 +44,14 @@ class MyChevroletConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     _candidate: Account | None = None
     _vehicles: dict[str, str]
     _reauth: bool = False
+    _native: NativeLogin | None = None
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Offer browser sign-in or a locally obtained token set."""
         return self.async_show_menu(
-            step_id="user", menu_options=["browser", "token_import"]
+            step_id="user", menu_options=["browser", "native", "token_import"]
         )
 
     async def async_step_reauth(
@@ -61,7 +64,85 @@ class MyChevroletConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_reauth_confirm(self) -> ConfigFlowResult:
         """Present reauthentication methods."""
         return self.async_show_menu(
-            step_id="reauth_confirm", menu_options=["browser", "token_import"]
+            step_id="reauth_confirm", menu_options=["browser", "native", "token_import"]
+        )
+
+    def _clear_native(self) -> None:
+        if self._native is not None:
+            self._native.clear()
+            self._native = None
+
+    async def async_step_native(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Try the observed password/authenticator journey without saving credentials."""
+        error = None
+        if user_input is not None:
+            self._clear_native()
+            self._candidate = await self._new_candidate()
+            self._native = NativeLogin(self._candidate.auth)
+            try:
+                needs_mfa = await self._native.start(
+                    user_input["username"].strip(), user_input["password"]
+                )
+            except NativeUnavailable:
+                self._clear_native()
+                return await self.async_step_native_unavailable()
+            except (AuthError, CloudError, OSError) as err:
+                error = (
+                    "invalid_auth" if isinstance(err, AuthError) else "cannot_connect"
+                )
+                self._clear_native()
+            else:
+                if needs_mfa:
+                    return await self.async_step_mfa()
+                self._clear_native()
+                return await self._discover()
+        return self.async_show_form(
+            step_id="native",
+            data_schema=vol.Schema(
+                {vol.Required("username"): str, vol.Required("password"): SECRET_INPUT}
+            ),
+            errors={"base": error} if error else {},
+        )
+
+    async def async_step_mfa(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Ask for the current authenticator code, never an authenticator seed."""
+        if self._native is None:
+            return await self.async_step_native()
+        error = None
+        if user_input is not None:
+            try:
+                await self._native.verify(user_input["code"].strip())
+            except NativeUnavailable:
+                self._clear_native()
+                return await self.async_step_native_unavailable()
+            except AuthError:
+                if (
+                    self._native.attempt.consumed
+                    or time.monotonic() >= self._native.attempt.deadline
+                ):
+                    self._clear_native()
+                    return await self.async_step_native()
+                error = "invalid_mfa"
+            except CloudError, OSError:
+                self._clear_native()
+                return await self.async_step_native_unavailable()
+            else:
+                self._clear_native()
+                return await self._discover()
+        return self.async_show_form(
+            step_id="mfa",
+            data_schema=vol.Schema({vol.Required("code"): SECRET_INPUT}),
+            errors={"base": error} if error else {},
+        )
+
+    async def async_step_native_unavailable(self) -> ConfigFlowResult:
+        """Stop rather than retry blocked or unrecognized website flows."""
+        return self.async_show_menu(
+            step_id="native_unavailable", menu_options=["browser", "token_import"]
         )
 
     async def _new_candidate(self) -> Account:
@@ -83,6 +164,7 @@ class MyChevroletConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Display GM's authorization URL and accept its mobile redirect."""
+        self._clear_native()
         error = None
         if self._candidate is None:
             self._candidate = await self._new_candidate()
@@ -119,6 +201,7 @@ class MyChevroletConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Import a Microsoft refresh token; confirm it directly with GM."""
+        self._clear_native()
         error = None
         if user_input is not None:
             try:

@@ -5,14 +5,16 @@
         "title": "Connect a GM account",
         "menu_options": {
           "browser": "Sign in with GM in your browser",
-          "token_import": "Import GM identity tokens"
+          "token_import": "Import GM identity tokens",
+          "native": "Sign in in Home Assistant (experimental)"
         }
       },
       "reauth_confirm": {
         "title": "Renew GM authorization",
         "menu_options": {
           "browser": "Sign in with GM in your browser",
-          "token_import": "Import GM identity tokens"
+          "token_import": "Import GM identity tokens",
+          "native": "Sign in in Home Assistant (experimental)"
         }
       },
       "browser_unavailable": {
@@ -24,7 +26,7 @@
       },
       "browser": {
         "title": "Sign in directly with GM",
-        "description": "Open your browser’s Network panel and enable persistent logging, then open [GM sign-in]({url}) and complete sign-in and MFA with GM. Find the final 302 from custlogin.gm.com and paste its full msauth.com.gm.mychevrolet://auth Location value here. Close the Network panel when done.",
+        "description": "Open your browser's Network panel and enable Preserve log, then open [GM sign-in]({url}) in that same tab and complete sign-in and MFA. Select the final 302 request to custlogin.gm.com. Under Response Headers, copy the Location header beginning msauth.com.gm.mychevrolet://auth (not the HTTPS request URL) and paste its full value here. Close the Network panel when done.",
         "data": {
           "redirect": "GM redirect URL"
         }
@@ -45,12 +47,36 @@
       "retry_discovery": {
         "title": "Retry vehicle discovery",
         "description": "GM did not return the vehicle list. Wait for service or throttling to recover, then retry with your current sign-in."
+      },
+      "native": {
+        "title": "Sign in to GM in Home Assistant",
+        "description": "Experimental support for GM password sign-in with an authenticator app. Home Assistant sends your credentials directly to GM and does not save your password. If GM requires a browser or a different verification method, use browser sign-in instead.",
+        "data": {
+          "username": "GM email address",
+          "password": "GM password"
+        }
+      },
+      "mfa": {
+        "title": "Verify your GM sign-in",
+        "description": "Enter the current six-digit code from your authenticator app within three minutes. Do not enter its setup key.",
+        "data": {
+          "code": "Authenticator code"
+        }
+      },
+      "native_unavailable": {
+        "title": "GM requires browser sign-in",
+        "description": "GM blocked the native request, the connection failed, or this sign-in journey is not supported. Continue with browser sign-in or import tokens. Native sign-in supports authenticator codes; email and SMS verification are not supported yet.",
+        "menu_options": {
+          "browser": "Sign in with GM in your browser",
+          "token_import": "Import GM identity tokens"
+        }
       }
     },
     "error": {
       "invalid_auth": "GM authorization was rejected, invalid or expired. Start a new sign-in or obtain a fresh token.",
       "cannot_connect": "The integration could not complete the request. Try again.",
-      "select_vehicles": "Select at least one available vehicle."
+      "select_vehicles": "Select at least one available vehicle.",
+      "invalid_mfa": "The code was rejected or the sign-in expired. Try a current code, or close setup and start again."
     },
     "abort": {
       "already_configured": "This account or vehicle is already configured.",

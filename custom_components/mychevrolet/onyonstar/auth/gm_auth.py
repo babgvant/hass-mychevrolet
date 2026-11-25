@@ -77,8 +77,8 @@ class BrowserAttempt:
         states = params.get("state", [])
         codes = params.get("code", [])
         if (
-            (target.scheme, target.netloc, target.path)
-            != (expected.scheme, expected.netloc, expected.path)
+            (target.scheme, target.netloc) != (expected.scheme, expected.netloc)
+            or target.path not in (expected.path, "/")
             or target.fragment
             or "error" in params
             or len(states) != 1

@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Add experimental native GM password and interactive authenticator MFA sign-in in Home Assistant, with browser/token fallback. Native sign-in remains optional pending live validation.
+- Accept GM's observed trailing-slash mobile callback and clarify that manual setup needs the response Location header, not the HTTPS request URL.
+
 ## 0.2.0
 
 - Add HACS custom repository metadata, release packaging, and CI checks.
