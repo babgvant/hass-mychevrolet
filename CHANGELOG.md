@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Try the garage endpoint once when the vehicle-list endpoint returns HTTP 5xx. Preserve both failures if it also fails; honor explicit Retry-After and rate limits.
 - Report setup discovery failures by token exchange, vehicle-list request or garage fallback, with HTTP status and cooldown details in the setup screen and sanitized warning logs.
 - Show the native sign-in failure stage and sanitized reason in the fallback screen and logs.
 - Add experimental native GM password and interactive authenticator MFA sign-in in Home Assistant, with browser/token fallback. Native sign-in remains optional pending live validation.

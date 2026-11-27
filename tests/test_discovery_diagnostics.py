@@ -26,14 +26,15 @@ def account():
     return result
 
 
-async def test_fallback_preserves_both_endpoint_failures():
+@pytest.mark.parametrize("status", [404, 500, 502, 503, 504])
+async def test_fallback_preserves_both_endpoint_failures(status):
     candidate = account()
-    candidate.api.api_request.side_effect = [CloudError(404), CloudError(503, 90)]
+    candidate.api.api_request.side_effect = [CloudError(status), CloudError(503, 90)]
     with pytest.raises(CloudError) as caught:
         await candidate.vehicles()
     assert caught.value.stage == "garage_list"
     details = " ".join(candidate.discovery_diagnostics)
-    assert "GET /api/v1/account/vehicles" in details and "HTTP 404" in details
+    assert "GET /api/v1/account/vehicles" in details and f"HTTP {status}" in details
     assert "POST /mbff/garage/v1" in details and "HTTP 503" in details
     assert "90 seconds" in details
     with pytest.raises(CloudError) as cooldown:
@@ -44,12 +45,52 @@ async def test_fallback_preserves_both_endpoint_failures():
     assert "HTTP 503" in " ".join(candidate.discovery_diagnostics)
 
 
-async def test_token_exchange_error_keeps_its_stage_and_skips_fallback():
+@pytest.mark.parametrize("status", [404, 500, 503])
+async def test_token_exchange_error_keeps_its_stage_and_skips_fallback(status):
     candidate = account()
-    candidate.api.api_request.side_effect = CloudError(404, stage="gm_token_exchange")
+    candidate.api.api_request.side_effect = CloudError(
+        status, stage="gm_token_exchange"
+    )
     with pytest.raises(CloudError) as caught:
         await candidate.vehicles()
     assert caught.value.stage == "gm_token_exchange"
+    assert candidate.api.api_request.await_count == 1
+
+
+@pytest.mark.parametrize("status", [500, 502, 503, 504])
+async def test_server_error_falls_back_to_garage_and_caches_success(status):
+    candidate = account()
+    vin = "1GC00000000000001"
+    candidate.api.api_request.side_effect = [
+        CloudError(status),
+        {"data": {"vehicles": [{"vin": vin, "model": "Synthetic EV"}]}},
+    ]
+    records = await candidate.vehicles()
+    assert records[vin]["garage_record"] is True
+    calls = candidate.api.api_request.call_args_list
+    assert calls[0].args[0] == "GET"
+    assert calls[1].args == ("POST", "/mbff/garage/v1")
+    assert "getVehiclesMBFF" in calls[1].kwargs["text_body"]
+    assert await candidate.vehicles() == records
+    assert candidate.api.api_request.await_count == 2
+    assert "vehicles" not in candidate.endpoint_deadlines
+    assert f"HTTP {status}" in " ".join(candidate.discovery_diagnostics)
+
+
+@pytest.mark.parametrize(
+    ("status", "retry_after"), [(401, 0), (429, 0), (429, 120), (503, 120), (404, 120)]
+)
+async def test_no_fallback_for_auth_rate_limit_or_explicit_retry_after(
+    status, retry_after
+):
+    candidate = account()
+    candidate.api.api_request.side_effect = CloudError(status, retry_after)
+    with pytest.raises(CloudError):
+        await candidate.vehicles()
+    assert candidate.api.api_request.await_count == 1
+    with pytest.raises(CloudError) as caught:
+        await candidate.vehicles()
+    assert caught.value.reason == "cooldown"
     assert candidate.api.api_request.await_count == 1
 
 
@@ -88,7 +129,7 @@ async def test_setup_screen_and_warning_include_sanitized_discovery_failure(
     hass, monkeypatch, caplog
 ):
     candidate = account()
-    candidate.api.api_request.side_effect = CloudError(502)
+    candidate.api.api_request.side_effect = [CloudError(502), CloudError(502)]
     monkeypatch.setattr(
         MyChevroletConfigFlow, "_new_candidate", AsyncMock(return_value=candidate)
     )
@@ -112,7 +153,7 @@ async def test_setup_screen_and_warning_include_sanitized_discovery_failure(
         "Local vehicle-discovery cooldown"
         in result["description_placeholders"]["detail"]
     )
-    assert candidate.api.api_request.await_count == 1
+    assert candidate.api.api_request.await_count == 2
     assert "private-refresh-token" not in detail + caplog.text
 
 

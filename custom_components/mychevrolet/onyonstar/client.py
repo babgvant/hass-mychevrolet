@@ -57,7 +57,14 @@ class Account:
         try:
             result = await self._discovery_request("vehicle_list", "GET", VEHICLES)
         except CloudError as error:
-            if error.stage != "vehicle_list" or error.status not in (403, 404, 410):
+            # One alternate discovery request can work when the legacy list
+            # endpoint fails. Never route around auth failures, throttling,
+            # an explicit Retry-After, or failures in the token exchange.
+            if (
+                error.stage != "vehicle_list"
+                or error.retry_after > 0
+                or not (error.status in (403, 404, 410) or 500 <= error.status <= 599)
+            ):
                 raise
         else:
             vehicles = object_at(result, "vehicles").get("vehicle")
