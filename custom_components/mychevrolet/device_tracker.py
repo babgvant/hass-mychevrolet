@@ -28,6 +28,11 @@ class MyChevroletTracker(TelemetryEntity, ScannerEntity):
     _attr_source_type = SourceType.GPS
 
     @property
+    def available(self) -> bool:
+        """Keep location freshness separate from last-known telemetry display."""
+        return self.coordinator.fresh(self.sample)
+
+    @property
     def sample(self) -> Sample | None:
         """Return the complete GPS sample."""
         return self.coordinator.location

@@ -266,6 +266,11 @@ class ChargeTimeSensor(TelemetryEntity, SensorEntity):
     _attr_state_class = MEASUREMENT
 
     @property
+    def available(self) -> bool:
+        """A live countdown requires a fresh estimate, unlike last-known values."""
+        return self.coordinator.fresh(self.sample)
+
+    @property
     def sample(self) -> Sample | None:
         """Use the timestamp estimate rather than a nominal charge rate."""
         return select_sample(self.coordinator, CHARGE_COMPLETE)

@@ -1,5 +1,7 @@
 """Common identity and freshness for myChevrolet entities."""
 
+from datetime import UTC, datetime
+
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
@@ -28,7 +30,7 @@ class MyChevroletEntity(CoordinatorEntity[MyChevroletDataUpdateCoordinator]):
 
 
 class TelemetryEntity(MyChevroletEntity):
-    """Make an individual stale sample unavailable."""
+    """Display last-known telemetry with its original age and freshness."""
 
     @property
     def sample(self) -> Sample | None:
@@ -38,11 +40,17 @@ class TelemetryEntity(MyChevroletEntity):
     @property
     def available(self) -> bool:
         """Keep sample availability independent of other endpoints."""
-        return self.coordinator.fresh(self.sample)
+        return self.sample is not None and not self.coordinator.auth_failed
 
     @property
-    def extra_state_attributes(self) -> dict[str, str]:
+    def extra_state_attributes(self) -> dict[str, str | int | bool]:
         """Report when the particular value was last observed."""
         if (sample := self.sample) is None:
             return {}
-        return {"sample_at": sample.at.isoformat(), "timestamp_source": sample.source}
+        age = max(0, (datetime.now(UTC) - sample.at).total_seconds())
+        return {
+            "sample_at": sample.at.isoformat(),
+            "timestamp_source": sample.source,
+            "sample_age_seconds": round(age),
+            "stale": age > self.coordinator.freshness_limit,
+        }

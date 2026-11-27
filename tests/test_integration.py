@@ -279,8 +279,7 @@ async def test_partial_stale_and_rate_limited_responses(hass, cloud):
     assert not coordinator.fresh(coordinator.ev["soc"])
     coordinator.async_update_listeners()
     assert (
-        hass.states.get(registered(hass, "sensor", VIN, "battery_level")).state
-        == "unavailable"
+        hass.states.get(registered(hass, "sensor", VIN, "battery_level")).state == "0.0"
     )
 
 
@@ -315,9 +314,23 @@ async def test_stale_ev_data_is_visible_in_health_and_diagnostics(hass, cloud):
     )
     assert (
         hass.states.get(registered(hass, "sensor", VIN, "battery_level")).state
-        == "unavailable"
+        == "63.0"
     )
     assert hass.states.get(registered(hass, "sensor", VIN, "health")).state == "stale"
+    battery = hass.states.get(registered(hass, "sensor", VIN, "battery_level"))
+    assert battery.attributes["stale"] is True
+    assert battery.attributes["sample_age_seconds"] >= 14400
+    assert battery.attributes["sample_at"] == stale_time.isoformat()
+    assert (
+        hass.states.get(registered(hass, "binary_sensor", VIN, "plug_state")).state
+        == "on"
+    )
+    assert (
+        hass.states.get(
+            registered(hass, "binary_sensor", VIN, "discharge_enabled")
+        ).state
+        == "off"
+    )
     # Unknown field names from upstream diagnostics must not be exported.
     coordinator.diagnostics[("private-email", "private-vin")] = next(
         iter(coordinator.ev.values())
@@ -348,6 +361,29 @@ async def test_stale_ev_data_is_visible_in_health_and_diagnostics(hass, cloud):
         == "63.0"
     )
     assert hass.states.get(registered(hass, "sensor", VIN, "health")).state == "ok"
+    assert (
+        hass.states.get(registered(hass, "sensor", VIN, "battery_level")).attributes[
+            "stale"
+        ]
+        is False
+    )
+
+
+async def test_missing_battery_sample_remains_unavailable(hass, cloud):
+    cloud["ev_metrics"].return_value = {
+        "utc": datetime.now(UTC).timestamp() * 1000,
+        "soc": None,
+        "tcl": 80,
+    }
+    await create_entry(hass)
+    assert (
+        hass.states.get(registered(hass, "sensor", VIN, "battery_level")).state
+        == "unavailable"
+    )
+    assert (
+        hass.states.get(registered(hass, "sensor", VIN, "target_charge_level")).state
+        == "80.0"
+    )
 
 
 async def test_private_account_storage_and_isolation(hass, cloud):
