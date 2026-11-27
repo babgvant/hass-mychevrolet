@@ -297,6 +297,59 @@ async def test_authentication_health_and_diagnostics_redaction(hass, cloud):
         assert sensitive not in diagnostic
 
 
+async def test_stale_ev_data_is_visible_in_health_and_diagnostics(hass, cloud):
+    stale_time = datetime.now(UTC) - timedelta(hours=4)
+    cloud["ev_metrics"].return_value = {
+        "utc": stale_time.timestamp() * 1000,
+        "soc": 63,
+        "tcl": 80,
+        "cplug": "plugged",
+        "disEnabled": False,
+    }
+    entry = await create_entry(hass)
+    coordinator = entry.runtime_data[VIN]
+    assert coordinator.endpoint_status == {"diagnostics": "ok", "ev_metrics": "stale"}
+    assert (
+        hass.states.get(registered(hass, "sensor", VIN, "odometer")).state
+        != "unavailable"
+    )
+    assert (
+        hass.states.get(registered(hass, "sensor", VIN, "battery_level")).state
+        == "unavailable"
+    )
+    assert hass.states.get(registered(hass, "sensor", VIN, "health")).state == "stale"
+    # Unknown field names from upstream diagnostics must not be exported.
+    coordinator.diagnostics[("private-email", "private-vin")] = next(
+        iter(coordinator.ev.values())
+    )
+    diagnostic = await async_get_config_entry_diagnostics(hass, entry)
+    vehicle_data = diagnostic["vehicles"][0]
+    assert vehicle_data["freshness_limit_seconds"] == 3600
+    soc = next(
+        item for item in vehicle_data["ev_sample_details"] if item["field"] == "soc"
+    )
+    assert soc["sample_at"] == stale_time.isoformat()
+    assert soc["age_seconds"] >= 14400
+    assert soc["fresh"] is False
+    assert "value" not in soc
+    assert "private-email" not in json.dumps(diagnostic)
+    assert "private-vin" not in json.dumps(diagnostic)
+    # A later fresh EV response restores availability and health.
+    cloud["ev_metrics"].return_value = {
+        "utc": datetime.now(UTC).timestamp() * 1000,
+        "soc": 63,
+        "tcl": 80,
+    }
+    coordinator._last_attempt.clear()
+    await coordinator.async_refresh()
+    assert coordinator.endpoint_status["ev_metrics"] == "ok"
+    assert (
+        hass.states.get(registered(hass, "sensor", VIN, "battery_level")).state
+        == "63.0"
+    )
+    assert hass.states.get(registered(hass, "sensor", VIN, "health")).state == "ok"
+
+
 async def test_private_account_storage_and_isolation(hass, cloud):
     first = await create_entry(hass)
     second = await create_entry(

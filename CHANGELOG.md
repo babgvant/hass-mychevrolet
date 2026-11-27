@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Include per-field timestamps and freshness in integration diagnostics without telemetry values. Report stale endpoint samples even when other endpoints remain fresh.
 - Try the garage endpoint once when the vehicle-list endpoint returns HTTP 5xx. Preserve both failures if it also fails; honor explicit Retry-After and rate limits.
 - Report setup discovery failures by token exchange, vehicle-list request or garage fallback, with HTTP status and cooldown details in the setup screen and sanitized warning logs.
 - Show the native sign-in failure stage and sanitized reason in the fallback screen and logs.

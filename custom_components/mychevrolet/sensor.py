@@ -342,6 +342,8 @@ class HealthSensor(MyChevroletEntity, SensorEntity):
             or not coordinator.last_update_success
         ):
             return "degraded"
+        if "stale" in statuses:
+            return "stale"
         if any(
             coordinator.fresh(sample)
             for samples in (coordinator.ev, coordinator.diagnostics)

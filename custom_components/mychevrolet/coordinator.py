@@ -209,7 +209,16 @@ class MyChevroletDataUpdateCoordinator(DataUpdateCoordinator[dict[str, str]]):
             )
         else:
             self._failures.pop(endpoint, None)
-            self.endpoint_status[endpoint] = "ok"
+            samples = (
+                self.ev.values()
+                if endpoint == "ev_metrics"
+                else self.diagnostics.values()
+                if endpoint == "diagnostics"
+                else [self.location]
+            )
+            self.endpoint_status[endpoint] = (
+                "ok" if any(self.fresh(sample) for sample in samples) else "stale"
+            )
 
     async def _async_update_data(self) -> dict[str, str]:
         """Refresh independent sources and retain useful cached samples."""
